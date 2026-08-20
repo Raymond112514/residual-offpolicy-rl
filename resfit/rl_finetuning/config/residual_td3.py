@@ -38,6 +38,7 @@ class BasePolicyConfig:
     wandb_id: str = "TODO"
     wt_type: str = "best"
     wt_version: str = "latest"
+    ckpt_path: str | None = None  # Local ACT checkpoint
 
 
 @dataclass

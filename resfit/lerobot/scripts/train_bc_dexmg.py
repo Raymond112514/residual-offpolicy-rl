@@ -29,11 +29,27 @@ python train_hf.py \
 
 from __future__ import annotations
 
+import os
+import sys
+
+# Savio's /lib64/libstdc++ is too old for conda-forge FFmpeg (libvpl needs
+# GLIBCXX_3.4.29). LD_LIBRARY_PATH is only read at process start, so re-exec
+# once with conda lib first. DataLoader spawn workers inherit this.
+_CONDA_LIB = os.path.join(sys.prefix, "lib")
+_LD_FLAG = "RESFIT_CONDA_LIBSTDCXX"
+if os.path.isdir(_CONDA_LIB):
+    _ld = os.environ.get("LD_LIBRARY_PATH", "")
+    _parts = [p for p in _ld.split(":") if p]
+    if not _parts or os.path.abspath(_parts[0]) != os.path.abspath(_CONDA_LIB):
+        os.environ["LD_LIBRARY_PATH"] = f"{_CONDA_LIB}:{_ld}" if _ld else _CONDA_LIB
+        if os.environ.get(_LD_FLAG) != "1":
+            os.environ[_LD_FLAG] = "1"
+            os.execv(sys.executable, [sys.executable, *sys.argv])
+
 import argparse
 import json
 import logging
 import multiprocessing as mp
-import os
 import re
 import shutil
 import time
@@ -103,6 +119,13 @@ parser.add_argument("--steps", type=int, default=100_000, help="Total optimizati
 parser.add_argument("--batch_size", type=int, default=64)
 parser.add_argument("--grad_clip_norm", type=float, default=10.0)
 parser.add_argument("--num_workers", type=int, default=4)
+parser.add_argument(
+    "--video_backend",
+    type=str,
+    default="torchcodec",
+    choices=["pyav", "torchcodec", "video_reader"],
+    help="Video decoder backend. torchcodec is faster; pyav is the fallback.",
+)
 
 # Reproducibility / device
 parser.add_argument("--seed", type=int, default=None)
@@ -540,6 +563,7 @@ def main(cfg: argparse.Namespace):
     delta_timestamps = resolve_delta_timestamps(policy_cfg, ds_meta)
 
     logger.info("Building LeRobotDataset with inferred delta-timestamps…")
+    logger.info(f"Using video backend: {cfg.video_backend}")
 
     image_transforms_config = ImageTransformsConfig(enable=True)
     image_transforms = ImageTransforms(image_transforms_config)
@@ -549,6 +573,7 @@ def main(cfg: argparse.Namespace):
         delta_timestamps=delta_timestamps,
         download_videos=True,
         image_transforms=image_transforms,
+        video_backend=cfg.video_backend,
     )
 
     # ---------------------------------------------------------------------
@@ -655,9 +680,11 @@ def main(cfg: argparse.Namespace):
     # ---------------------------------------------------------------------
     # Training loop
     # ---------------------------------------------------------------------
-    # Use the run cache directory for outputs instead of the default
-    output_dir = run_cache_dir
+    # Checkpoints go to --output_dir (kept on disk). run_cache_dir is only for
+    # transient files and is deleted at the end if it is a different path.
+    output_dir = Path(cfg.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    logger.info(colored(f"Checkpoints will be saved to {output_dir}", "yellow"))
 
     step = start_step
     eval_env = None  # type: ignore  # will hold the evaluation environment if created
@@ -894,11 +921,11 @@ def main(cfg: argparse.Namespace):
     # ---------------------------------------------------------------------
     # Cleanup --------------------------------------------------------------
     # ---------------------------------------------------------------------
-    # Clean up entire run directory after successful completion (videos/logs are saved to wandb)
-    if run_cache_dir.exists():
-        logger.info(f"Cleaning up run directory: {run_cache_dir}")
+    # Do not delete checkpoints. Only remove the transient cache dir if it is
+    # separate from --output_dir.
+    if run_cache_dir.exists() and run_cache_dir.resolve() != output_dir.resolve():
+        logger.info(f"Cleaning up run cache directory: {run_cache_dir}")
         shutil.rmtree(run_cache_dir)
-        logger.info("Run directory cleaned up successfully.")
 
 
 if __name__ == "__main__":

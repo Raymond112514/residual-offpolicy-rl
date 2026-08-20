@@ -34,10 +34,10 @@ import tensordict
 import torch
 import torchrl
 from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
-from omegaconf import OmegaConf
+from omegaconf import OmegaConf, open_dict
 from tensordict import TensorDict
 from torch.utils.data import DataLoader
-from torchrl.data import LazyTensorStorage, ReplayBuffer, TensorDictPrioritizedReplayBuffer
+from torchrl.data import LazyTensorStorage, ReplayBuffer, TensorDictPrioritizedReplayBuffer, TensorDictReplayBuffer
 from tqdm import tqdm
 
 import wandb
@@ -144,6 +144,42 @@ if "MUJOCO_EGL_DEVICE_ID" in os.environ:
     del os.environ["MUJOCO_EGL_DEVICE_ID"]
 
 
+def _make_replay_buffer(
+    *,
+    max_size: int,
+    batch_size: int,
+    n_step: int,
+    gamma: float,
+    prefetch: int,
+    use_per: bool,
+    alpha: float,
+    beta: float,
+) -> ReplayBuffer:
+    """Build a replay buffer. Falls back to uniform if TorchRL PER C++ ext is missing."""
+    kwargs = dict(
+        storage=LazyTensorStorage(max_size=max_size, device="cpu"),
+        transform=MultiStepTransform(n_steps=n_step, gamma=gamma),
+        pin_memory=True,
+        prefetch=prefetch,
+        batch_size=batch_size,
+    )
+    if use_per:
+        try:
+            return TensorDictPrioritizedReplayBuffer(
+                alpha=alpha,
+                beta=beta,
+                eps=1e-6,
+                priority_key="_priority",
+                **kwargs,
+            )
+        except (NameError, ImportError) as err:
+            print(
+                "WARNING: TorchRL prioritized replay C++ extension is unavailable "
+                f"({err}). Using uniform TensorDictReplayBuffer instead."
+            )
+    return TensorDictReplayBuffer(**kwargs)
+
+
 def _add_transitions_to_buffer(
     *,
     obs: dict,
@@ -156,7 +192,7 @@ def _add_transitions_to_buffer(
     image_keys: list[str],
     lowdim_keys: list[str],
     num_envs: int,
-    online_rb: TensorDictPrioritizedReplayBuffer,
+    online_rb: ReplayBuffer,
 ) -> None:
     """Helper function to create transitions and add them to the replay buffer.
 
@@ -199,6 +235,18 @@ def _add_transitions_to_buffer(
         online_rb.add(td)
 
 
+def _resolve_local_policy_dir(ckpt: str | Path) -> Path:
+    ckpt = Path(ckpt).expanduser().resolve()
+    if (ckpt / "policy" / "config.json").exists():
+        return ckpt / "policy"
+    if (ckpt / "config.json").exists():
+        return ckpt
+    raise FileNotFoundError(
+        f"No policy config.json under {ckpt} or {ckpt / 'policy'}. "
+        "Pass a policy_step_<n> dir, latest/, or the policy/ folder itself."
+    )
+
+
 # -----------------------------------------------------------------------------
 # Main training loop -----------------------------------------------------------
 # -----------------------------------------------------------------------------
@@ -217,11 +265,16 @@ def main(cfg: ResidualTD3DexmgConfig):
     # for residual learning.
     # ---------------------------------------------------------------------
     assert "base_policy" in cfg, "Base policy configuration is required"
-    policy_dir, _ = download_policy_from_wandb(
-        cfg.base_policy.wandb_id,
-        step=cfg.base_policy.wt_type,
-        artifact_version=cfg.base_policy.wt_version,
-    )
+    ckpt_path = getattr(cfg.base_policy, "ckpt_path", None)
+    if ckpt_path:
+        policy_dir = _resolve_local_policy_dir(ckpt_path)
+        print(f"Loading base policy from local checkpoint: {policy_dir}")
+    else:
+        policy_dir, _ = download_policy_from_wandb(
+            cfg.base_policy.wandb_id,
+            step=cfg.base_policy.wt_type,
+            artifact_version=cfg.base_policy.wt_version,
+        )
 
     base_policy: ACTPolicy = load_policy(policy_dir)
     base_policy.to(device)
@@ -383,12 +436,9 @@ def main(cfg: ResidualTD3DexmgConfig):
     # ---------------------------------------------------------------------
     # Replay buffers -------------------------------------------------------
     # ---------------------------------------------------------------------
-    # -----------------------------------------------------------------
-    # Use TensorDictPrioritizedReplayBuffer for unified PER support
-    # For uniform sampling, we'll use alpha=0 and beta=0, and never update priorities
-    # -----------------------------------------------------------------
-    alpha = cfg.algo.priority_alpha if cfg.algo.sampling_strategy == "prioritized_replay" else 0.0
-    beta = cfg.algo.priority_beta if cfg.algo.sampling_strategy == "prioritized_replay" else 0.0
+    use_per = cfg.algo.sampling_strategy == "prioritized_replay"
+    alpha = cfg.algo.priority_alpha if use_per else 0.0
+    beta = cfg.algo.priority_beta if use_per else 0.0
 
     online_batch_size = int(cfg.algo.batch_size * (1 - cfg.algo.offline_fraction))
     offline_batch_size = int(cfg.algo.batch_size * cfg.algo.offline_fraction)
@@ -396,18 +446,20 @@ def main(cfg: ResidualTD3DexmgConfig):
     if cfg.algo.offline_fraction == 0.0:
         print("Online-only training mode: offline_fraction=0.0")
 
-    # Use TensorDictPrioritizedReplayBuffer with optimized prefetching
-    online_rb = TensorDictPrioritizedReplayBuffer(
-        storage=LazyTensorStorage(max_size=cfg.algo.buffer_size, device="cpu"),
+    online_rb = _make_replay_buffer(
+        max_size=cfg.algo.buffer_size,
+        batch_size=online_batch_size,
+        n_step=cfg.algo.n_step,
+        gamma=cfg.algo.gamma,
+        prefetch=cfg.algo.prefetch_batches,
+        use_per=use_per,
         alpha=alpha,
         beta=beta,
-        eps=1e-6,  # Small epsilon added to priorities to prevent zero values
-        priority_key="_priority",
-        transform=MultiStepTransform(n_steps=cfg.algo.n_step, gamma=cfg.algo.gamma),
-        pin_memory=True,
-        prefetch=cfg.algo.prefetch_batches,  # Add prefetching
-        batch_size=online_batch_size,
     )
+    if use_per and not isinstance(online_rb, TensorDictPrioritizedReplayBuffer):
+        use_per = False
+        with open_dict(cfg.algo):
+            cfg.algo.sampling_strategy = "uniform"
 
     # ------------------------------------------------------------------
     # Caching layer for online replay buffer ----------------------------
@@ -493,16 +545,15 @@ def main(cfg: ResidualTD3DexmgConfig):
     else:
         print("Online-only mode: creating minimal offline buffer (unused)")
 
-    offline_rb = TensorDictPrioritizedReplayBuffer(
-        storage=LazyTensorStorage(max_size=max_offline_transitions, device="cpu"),
+    offline_rb = _make_replay_buffer(
+        max_size=max_offline_transitions,
+        batch_size=max(offline_batch_size, 1),
+        n_step=cfg.algo.n_step,
+        gamma=cfg.algo.gamma,
+        prefetch=cfg.algo.prefetch_batches,
+        use_per=use_per,
         alpha=alpha,
         beta=beta,
-        eps=1e-6,  # Small epsilon added to priorities to prevent zero values
-        priority_key="_priority",
-        transform=MultiStepTransform(n_steps=cfg.algo.n_step, gamma=cfg.algo.gamma),
-        pin_memory=True,
-        prefetch=cfg.algo.prefetch_batches,  # Add prefetching
-        batch_size=max(offline_batch_size, 1),  # Ensure batch_size is at least 1
     )
 
     # Normalization functions already defined above - use them
