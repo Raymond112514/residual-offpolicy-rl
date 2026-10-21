@@ -18,6 +18,9 @@ Key features
 6.  Saves checkpoints using `policy.save_pretrained(…)` so that they can later
     be re-loaded with `PreTrainedPolicy.from_pretrained(…)` **or** retrieved
     directly from W&B artefacts for evaluation.
+7.  At step 0 and every checkpoint (`--save_freq`), rolls out the policy,
+    fits PCA on action chunks, and logs the spectrum to W&B as
+    `spectrum/eval_step_{step}`.
 
 Example
 =======
@@ -46,6 +49,16 @@ if os.path.isdir(_CONDA_LIB):
             os.environ[_LD_FLAG] = "1"
             os.execv(sys.executable, [sys.executable, *sys.argv])
 
+# Spawned AsyncVectorEnv workers re-import this file with sys.path[0] =
+# resfit/lerobot/scripts/, so `import resfit` fails unless the repo root is
+# on PYTHONPATH / sys.path.
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+_py_path = os.environ.get("PYTHONPATH", "")
+if _REPO_ROOT not in _py_path.split(os.pathsep):
+    os.environ["PYTHONPATH"] = f"{_REPO_ROOT}{os.pathsep}{_py_path}" if _py_path else _REPO_ROOT
+
 import argparse
 import json
 import logging
@@ -58,7 +71,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-import imageio
 import numpy as np
 import torch
 from lerobot.common.datasets.factory import resolve_delta_timestamps
@@ -66,7 +78,6 @@ from lerobot.common.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatas
 from lerobot.common.datasets.transforms import ImageTransforms, ImageTransformsConfig
 from lerobot.common.datasets.utils import cycle
 from lerobot.common.utils.random_utils import set_seed
-from PIL import Image, ImageDraw, ImageFont
 from termcolor import colored
 
 import wandb
@@ -134,7 +145,7 @@ parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_availa
 # Logging & checkpoints
 parser.add_argument("--output_dir", type=str, default="outputs/train_hf")
 parser.add_argument("--log_freq", type=int, default=100, help="How often to print & log to W&B (in steps)")
-parser.add_argument("--save_freq", type=int, default=10_000, help="How often to save checkpoints (in steps)")
+parser.add_argument("--save_freq", type=int, default=1_000, help="How often to save checkpoints (in steps)")
 
 # WandB
 parser.add_argument("--wandb_enable", action="store_true", help="Enable Weights & Biases logging")
@@ -151,27 +162,29 @@ parser.add_argument(
 )
 
 # ------------------------------------------------------------------
-# Evaluation rollouts
+# PCA spectrum eval (rollouts at each checkpoint, including step 0)
 # ------------------------------------------------------------------
 parser.add_argument(
     "--rollout_freq",
     type=int,
     default=None,
     help=(
-        "Frequency (in optimization steps) at which to run rollouts in a "
-        "DexMimicGen environment to compute the success-rate of the current "
-        "policy. Disabled when not set."
+        "Deprecated / unused. PCA spectrum eval runs at step 0 and at every "
+        "checkpoint (--save_freq), not on a separate success-rate schedule."
     ),
 )
 parser.add_argument(
     "--eval_env",
     type=str,
     default=None,
-    help="DexMimicGen environment name used for evaluation rollouts.",
+    help="DexMimicGen environment name used for PCA spectrum rollouts.",
 )
-parser.add_argument("--eval_num_envs", type=int, default=5, help="Number of parallel environments for evaluation.")
+parser.add_argument("--eval_num_envs", type=int, default=5, help="Number of parallel environments for PCA rollouts.")
 parser.add_argument(
-    "--eval_num_episodes", type=int, default=20, help="Total number of episodes to run during evaluation."
+    "--eval_num_episodes",
+    type=int,
+    default=20,
+    help="Episodes to roll out for PCA at step 0 and at every checkpoint.",
 )
 parser.add_argument(
     "--eval_camera_size", type=int, default=84, help="Camera image size for evaluation rollouts (should match dataset)."
@@ -237,8 +250,6 @@ parser.add_argument(
     ),
 )
 
-args_cli = parser.parse_args()
-
 # -------------------------------------------------
 # Setup logging
 # -------------------------------------------------
@@ -254,172 +265,210 @@ logger = logging.getLogger(__name__)
 
 
 # -----------------------------------------------------------------------------
-# Evaluation helpers
+# PCA spectrum eval (rollouts → action-chunk PCA → wandb)
 # -----------------------------------------------------------------------------
 
 
-def _annotate_frame(
-    frame: np.ndarray,
-    env_idx: int,
-    episode_num: int,
-    total_episodes: int,
-    episode_step: int,
-    is_success: bool,
-    font=None,
-) -> np.ndarray:
-    """Annotate a single frame with episode information."""
-    # Add text annotation to the frame
-    pil_img = Image.fromarray(frame)
-    draw = ImageDraw.Draw(pil_img)
+def _collect_action_chunks(
+    policy: PreTrainedPolicy,
+    env: VectorizedEnvWrapper,
+    *,
+    num_episodes: int,
+    chunk_size: int,
+) -> tuple[np.ndarray, float, int, int]:
+    """Roll out *num_episodes* and return (chunks, success_rate, n_success, n_episodes).
 
-    # Prepare episode status text
-    episode_text = f"Env {env_idx + 1} | Episode {episode_num}/{total_episodes}"
-    step_text = f"Step {episode_step}"
-    status_text = "SUCCESS" if is_success else "FAIL"
-    status_color = (0, 255, 0) if is_success else (255, 0, 0)
+    Chunks have shape (N, chunk_size, action_dim). Success is reward == 1 at episode end.
+    """
+    policy_was_training = policy.training
+    policy.eval()
 
-    # Add text annotations
-    y_offset = 10
-    draw.text((10, y_offset), episode_text, fill=(255, 255, 255), font=font)
-    y_offset += 15
-    draw.text((10, y_offset), step_text, fill=(255, 255, 255), font=font)
-    y_offset += 15
-    draw.text((10, y_offset), status_text, fill=status_color, font=font)
+    num_envs = env.num_envs
+    env_name = getattr(env, "env_name", "unknown")
+    logger.info(
+        f"PCA rollouts in {env_name}: {num_episodes} episodes, {num_envs} parallel envs, chunk_size={chunk_size}"
+    )
 
-    # Convert back to numpy array
-    return np.array(pil_img)
+    ep_actions: list[list[np.ndarray]] = [[] for _ in range(num_envs)]
+    chunks: list[np.ndarray] = []
+    done_episodes = 0
+    n_success = 0
+    total_steps = 0
+    start_time = time.perf_counter()
+
+    obs, _ = env.reset()
+    policy.reset()
+
+    while done_episodes < num_episodes:
+        with torch.inference_mode():
+            action = policy.select_action(obs)
+        action_np = action.detach().float().cpu().numpy()
+        for i in range(num_envs):
+            ep_actions[i].append(action_np[i])
+
+        obs, reward, terminated, truncated, _info = env.step(action)
+        total_steps += num_envs
+        done = terminated | truncated
+
+        if bool(done.any().item()):
+            terminated_envs = torch.where(done)[0]
+            policy.reset(env_ids=terminated_envs)
+            for env_idx in terminated_envs:
+                i = int(env_idx.item())
+                if done_episodes >= num_episodes:
+                    ep_actions[i] = []
+                    continue
+                a = np.stack(ep_actions[i], axis=0)
+                n = (len(a) // chunk_size) * chunk_size
+                if n == 0:
+                    logger.warning(
+                        "Episode %d too short (%d steps) for chunk_size=%d",
+                        done_episodes + 1,
+                        len(a),
+                        chunk_size,
+                    )
+                else:
+                    chunks.append(a[:n].reshape(-1, chunk_size, a.shape[-1]))
+                is_success = bool(reward[i].item() == 1.0)
+                n_success += int(is_success)
+                done_episodes += 1
+                ep_actions[i] = []
+            if done_episodes >= num_episodes:
+                break
+
+        if total_steps % 1_000 == 0:
+            logger.info(
+                f"PCA rollouts: {total_steps} steps, {done_episodes}/{num_episodes} episodes, "
+                f"{n_success} successes, "
+                f"{total_steps / max(time.perf_counter() - start_time, 1e-6):.1f} fps"
+            )
+
+    if policy_was_training:
+        policy.train()
+
+    if not chunks:
+        raise RuntimeError("No action chunks collected for PCA")
+    out = np.concatenate(chunks, axis=0)
+    elapsed = time.perf_counter() - start_time
+    success_rate = n_success / done_episodes if done_episodes > 0 else 0.0
+    logger.info(
+        f"Collected {out.shape[0]} chunks of shape ({out.shape[1]}, {out.shape[2]}) "
+        f"from {done_episodes} episodes in {elapsed:.1f}s "
+        f"({n_success}/{done_episodes} success, {success_rate * 100:.1f}%)"
+    )
+    return out, success_rate, n_success, done_episodes
 
 
-def _run_rollouts(
+def _explained_variance_from_chunks(chunks: np.ndarray) -> np.ndarray:
+    """PCA explained-variance ratio of flattened action chunks, largest first."""
+    n, t, d = chunks.shape
+    x = chunks.reshape(n, t * d).astype(np.float64)
+    x = x - x.mean(axis=0, keepdims=True)
+    _u, s, _vt = np.linalg.svd(x, full_matrices=False)
+    eig = (s**2) / max(n - 1, 1)
+    total = float(eig.sum())
+    return (eig / max(total, 1e-12)).astype(np.float64)
+
+
+def _plot_spectrum(explained: np.ndarray, path: Path, *, step: int, max_show: int = 50) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    n_show = min(max_show, len(explained))
+    xs = np.arange(1, n_show + 1)
+    cum = np.cumsum(explained)
+    fig, axes = plt.subplots(2, 1, figsize=(8, 6), sharex=True)
+    axes[0].bar(xs, explained[:n_show], color="steelblue", width=0.8)
+    axes[0].set_ylabel("Explained variance")
+    axes[0].set_title(f"PCA spectrum of action chunks (step {step})")
+    axes[0].grid(True, axis="y", alpha=0.3)
+    axes[1].plot(xs, cum[:n_show], color="darkorange", marker="o", markersize=3)
+    axes[1].axhline(0.9, color="gray", ls="--", lw=1, label="90%")
+    axes[1].axhline(0.99, color="gray", ls=":", lw=1, label="99%")
+    axes[1].set_xlabel("Principal component")
+    axes[1].set_ylabel("Cumulative")
+    axes[1].set_ylim(0.0, 1.02)
+    axes[1].legend(loc="lower right")
+    axes[1].grid(True, alpha=0.3)
+    fig.tight_layout()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+
+
+def _n_pcs_to_threshold(explained: np.ndarray, threshold: float) -> int:
+    if len(explained) == 0:
+        return 0
+    cum = np.cumsum(explained)
+    idx = int(np.searchsorted(cum, threshold, side="left"))
+    return min(idx + 1, len(explained))
+
+
+def _run_pca_eval(
     *,
     policy: PreTrainedPolicy,
     env: VectorizedEnvWrapper,
     save_dir: Path,
     step: int,
     num_episodes: int,
-    run_start_time: str,
-):
-    """Run *num_episodes* episodes with *policy* in vectorized *env* and compute success-rate.
-
-    Captures a video, writes it to *save_dir*/`eval_step_<step>.mp4`, and returns `(success_rate, video_path)`.
-    """
-
-    save_dir.mkdir(parents=True, exist_ok=True)
-
-    policy_was_training = policy.training
-    policy.eval()
-
-    # Get environment info
-    num_parallel_envs = env.num_envs
-    env_name = getattr(env, "env_name", "Unknown")
-
-    successes = 0
-    done_episodes = 0
-    total_steps = 0
-
-    start_time = time.perf_counter()
-
-    logger.info(f"Running rollouts with environment: {env_name}")
-    logger.info(f"Starting evaluation: {num_episodes} episodes using {num_parallel_envs} parallel environments")
-
-    # Try to load a font for text annotations
-    try:
-        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 10)
-    except:
-        try:
-            font = ImageFont.load_default()
-        except:
-            font = None
-
-    # Create video writer at the beginning
-    now = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    parent_dir = save_dir / f"eval_{env_name.lower()}" / run_start_time
-    parent_dir.mkdir(parents=True, exist_ok=True)
-    video_path = parent_dir / f"eval_step_{step}_{now}.mp4"
-
-    video_writer = imageio.get_writer(video_path.as_posix(), fps=20)
-
-    obs, _ = env.reset()
-    episode_frames = [[] for _ in range(num_parallel_envs)]
-    episode_steps = [0] * num_parallel_envs
-
-    while done_episodes < num_episodes:
-        # Run episodes in parallel until we complete the required number
-        with torch.inference_mode():
-            # Convert numpy observations to PyTorch tensors for the policy
-            action = policy.select_action(obs)
-
-        obs, reward, terminated, truncated, info = env.step(action)
-
-        frames = env.render()
-        for env_idx in range(num_parallel_envs):
-            episode_frames[env_idx].append(frames[env_idx])
-            episode_steps[env_idx] += 1
-
-        total_steps += num_parallel_envs
-
-        done = terminated | truncated
-
-        if any(done):
-            terminated_envs = torch.where(done)[0]
-            success_envs = torch.where(reward == 1.0)[0]
-
-            # Reset policy hidden state for the terminated envs.
-            policy.reset(env_ids=terminated_envs)
-
-            # Annotate and write frames for completed episodes immediately
-            for env_idx in terminated_envs:
-                env_idx_int = env_idx.item()
-                is_success = env_idx in success_envs
-                done_episodes += 1
-                successes += int(is_success)
-
-                # Annotate each frame in this episode and write to video
-                for step_idx, frame in enumerate(episode_frames[env_idx_int]):
-                    annotated_frame = _annotate_frame(
-                        frame=frame,
-                        env_idx=env_idx_int,
-                        episode_num=done_episodes,
-                        total_episodes=num_episodes,
-                        episode_step=step_idx + 1,
-                        is_success=is_success,
-                        font=font,
-                    )
-                    # Write frame immediately to video
-                    video_writer.append_data(annotated_frame)
-
-                # Reset for next episode
-                episode_frames[env_idx_int] = []
-                episode_steps[env_idx_int] = 0
-
-        if total_steps % 1_000 == 0:
-            logger.info(
-                f"Total steps: {total_steps}, done episodes: {done_episodes}, successes: {successes}, "
-                f"FPS: {total_steps / (time.perf_counter() - start_time):.1f}"
-            )
-
-    video_writer.close()
-
-    success_rate = successes / done_episodes if done_episodes > 0 else 0.0
-
-    if policy_was_training:
-        policy.train()
-
-    # Calculate final performance metrics
-    total_elapsed_time = time.perf_counter() - start_time
-    final_fps = total_steps / total_elapsed_time if total_elapsed_time > 0 else 0.0
-    episodes_per_sec = done_episodes / total_elapsed_time if total_elapsed_time > 0 else 0.0
-
-    logger.info(f"Evaluation completed: {done_episodes} episodes, {successes} successes ({success_rate * 100:.1f}%)")
-    logger.info(f"Performance: {total_steps} total steps in {total_elapsed_time:.1f}s")
-    logger.info(f"Average FPS: {final_fps:.1f} frames/sec | Episodes/sec: {episodes_per_sec:.2f}")
-    logger.info(
-        f"Parallel efficiency: {num_parallel_envs} environments,"
-        f" {final_fps / num_parallel_envs:.1f} frames/sec per environment"
+    log_wandb: bool,
+) -> None:
+    """Roll out the policy, fit PCA on action chunks, save + log the spectrum."""
+    chunk_size = int(getattr(policy.config, "chunk_size", 20))
+    t0 = time.perf_counter()
+    chunks, success_rate, n_success, n_done = _collect_action_chunks(
+        policy, env, num_episodes=num_episodes, chunk_size=chunk_size
     )
-    logger.info(f"Video saved with annotated frames: {video_path}")
+    explained = _explained_variance_from_chunks(chunks)
 
-    return success_rate, video_path, final_fps
+    spectrum_dir = save_dir / "spectrum"
+    plot_path = spectrum_dir / f"eval_step_{step}.png"
+    npz_path = spectrum_dir / f"eval_step_{step}.npz"
+    _plot_spectrum(explained, plot_path, step=step)
+    np.savez_compressed(
+        npz_path,
+        explained_variance_ratio=explained.astype(np.float32),
+        n_chunks=np.array([chunks.shape[0]], dtype=np.int32),
+        chunk_size=np.array([chunks.shape[1]], dtype=np.int32),
+        action_dim=np.array([chunks.shape[2]], dtype=np.int32),
+    )
+
+    n_pcs_90 = _n_pcs_to_threshold(explained, 0.9)
+    n_pcs_99 = _n_pcs_to_threshold(explained, 0.99)
+    top8 = float(explained[: min(8, len(explained))].sum())
+    elapsed = time.perf_counter() - t0
+    logger.info(
+        colored(
+            f"[step {step:>6d}] eval success-rate: {success_rate * 100:.1f}% "
+            f"({n_success}/{n_done}) | PCA: n_chunks={chunks.shape[0]} "
+            f"pc1={explained[0]:.3f} top8={top8:.3f} n_pcs_90={n_pcs_90} n_pcs_99={n_pcs_99} "
+            f"({elapsed:.1f}s) -> {plot_path}",
+            "cyan",
+        )
+    )
+
+    if log_wandb:
+        n_show = min(50, len(explained))
+        cum = np.cumsum(explained)
+        table = wandb.Table(columns=["pc", "explained_variance_ratio", "cumulative"])
+        for i in range(n_show):
+            table.add_data(i + 1, float(explained[i]), float(cum[i]))
+        payload: dict[str, Any] = {
+            "eval/success_rate": success_rate,
+            "eval/n_success": n_success,
+            "eval/n_episodes": n_done,
+            f"spectrum/eval_step_{step}": wandb.Image(str(plot_path), caption=f"PCA spectrum @ step {step}"),
+            "spectrum/values": table,
+            "spectrum/n_chunks": int(chunks.shape[0]),
+            "spectrum/pc1_explained": float(explained[0]),
+            "spectrum/top8_explained": top8,
+            "spectrum/n_pcs_90": n_pcs_90,
+            "spectrum/n_pcs_99": n_pcs_99,
+            "time/pca_eval_s": elapsed,
+        }
+        wandb.log(payload, step=step)
 
 
 # -----------------------------------------------------------------------------
@@ -433,9 +482,6 @@ def main(cfg: argparse.Namespace):
     # ---------------------------------------------------------------------
     device = torch.device(cfg.device)
     logger.info(colored(f"Using device: {device}", "green"))
-
-    # Create run start time for organizing video outputs
-    run_start_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
     # Create a timestamped folder in CACHE_DIR for all outputs
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -689,10 +735,7 @@ def main(cfg: argparse.Namespace):
     step = start_step
     eval_env = None  # type: ignore  # will hold the evaluation environment if created
 
-    # Track the best evaluation success-rate achieved so far (used for early-stopping style checkpointing)
-    best_success_rate = 0.0
-
-    if cfg.rollout_freq and cfg.eval_env:
+    if cfg.eval_env:
         # ------------------------------------------------------------------
         # Create the DexMimicGen evaluation environment
         # ------------------------------------------------------------------
@@ -723,35 +766,41 @@ def main(cfg: argparse.Namespace):
         envs = dexmimicgen_envs + robomimic_envs + mimicgen_envs
 
         if cfg.eval_env in envs:
-            # Create evaluation environment (vectorized or single based on debug flag)
-            logger.info(f"Creating evaluation environment: {cfg.eval_env}")
-
-            if cfg.debug:
-                # Debug mode: use synchronous vectorized environment for easier debugging
-                logger.info("Debug mode enabled: using synchronous vectorized environment")
-                eval_env = create_vectorized_env(
-                    env_name=cfg.eval_env,
-                    num_envs=cfg.eval_num_envs,
-                    device=device_str,
-                    camera_size=cfg.eval_camera_size,
-                    render_size=cfg.eval_render_size,
-                    video_key=cfg.eval_video_key,
-                    debug=True,
-                )
-            else:
-                # Production mode: use asynchronous multiprocessing environment for speed
-                logger.info("Production mode: using asynchronous multiprocessing environment")
-                eval_env = create_vectorized_env(
-                    env_name=cfg.eval_env,
-                    num_envs=cfg.eval_num_envs,
-                    device=device_str,
-                    camera_size=cfg.eval_camera_size,
-                    render_size=cfg.eval_render_size,
-                    video_key=cfg.eval_video_key,
-                    debug=False,
-                )
+            # SyncVectorEnv only: AsyncVectorEnv spawn re-executes this file as
+            # __main__ (python -m) and either nests extra trainers or dies with
+            # BrokenPipe. PCA eval does not need async workers.
+            logger.info(f"Creating evaluation environment: {cfg.eval_env} (SyncVectorEnv, {cfg.eval_num_envs} envs)")
+            eval_env = create_vectorized_env(
+                env_name=cfg.eval_env,
+                num_envs=cfg.eval_num_envs,
+                device=device_str,
+                camera_size=cfg.eval_camera_size,
+                render_size=cfg.eval_render_size,
+                video_key=cfg.eval_video_key,
+                debug=True,
+            )
         else:
             raise ValueError(f"Unknown environment: {cfg.eval_env}. Supported environments are: {envs}")
+
+    def _pca_at_step(eval_step: int) -> None:
+        if eval_env is None:
+            return
+        _run_pca_eval(
+            policy=policy,
+            env=eval_env,
+            save_dir=output_dir,
+            step=eval_step,
+            num_episodes=cfg.eval_num_episodes,
+            log_wandb=bool(cfg.wandb_enable),
+        )
+
+    # Untrained policy, before any updates in this run.
+    if start_step == 0:
+        if eval_env is None:
+            logger.info("No --eval_env; skipping PCA spectrum eval")
+        else:
+            logger.info(colored("Running PCA spectrum eval at step 0 (before training)", "cyan"))
+            _pca_at_step(0)
 
     while step < cfg.steps:
         # ------------------------------------------------------------------
@@ -842,74 +891,9 @@ def main(cfg: argparse.Namespace):
                 art_latest.add_dir(str(latest_dir))
                 wandb.log_artifact(art_latest, aliases=["latest"])
 
+            _pca_at_step(step)
+
         step += 1
-
-        # ------------------------------------------------------------------
-        # Rollout evaluation -----------------------------------------------
-        # ------------------------------------------------------------------
-        if (
-            cfg.rollout_freq is not None
-            and cfg.eval_env is not None
-            and step % cfg.rollout_freq == 0
-            and step != start_step
-        ):
-            rollout_t0 = time.perf_counter()
-
-            success_rate, video_path, final_fps = _run_rollouts(
-                policy=policy,
-                env=eval_env,
-                save_dir=output_dir,
-                step=step,
-                num_episodes=cfg.eval_num_episodes,
-                run_start_time=run_start_time,
-            )
-
-            rollout_ms = (time.perf_counter() - rollout_t0) * 1000
-
-            logger.info(
-                colored(
-                    f"[step {step:>6d}] eval success-rate: {success_rate * 100:.1f}% | "
-                    f"rollout: {rollout_ms / 1000:.2f} s | {final_fps:.1f} fps",
-                    "cyan",
-                )
-            )
-
-            if wandb is not None:
-                wandb.log(
-                    {
-                        "eval/success_rate": success_rate,
-                        "time/rollout_ms": rollout_ms,
-                    },
-                    step=step,
-                )
-                if video_path is not None and video_path.exists():
-                    fps = eval_env.fps
-                    wandb.log({"eval/rollout_video": wandb.Video(str(video_path), format="mp4", fps=fps)}, step=step)
-
-            # -------------------------------------------------------------
-            # Checkpoint the model whenever we obtain a new best success-rate
-            # -------------------------------------------------------------
-            if success_rate > best_success_rate:
-                best_success_rate = success_rate
-                logger.info(colored(f"New best success-rate! Saving checkpoint at step {step}", "magenta"))
-
-                # 1) Save model-only weights for lightweight history
-                best_model_dir = output_dir / f"best_step_{step}"
-                best_model_dir.mkdir(parents=True, exist_ok=True)
-                policy.save_pretrained(best_model_dir / "policy")
-
-                # 2) Save the full training state (includes model weights) under a constant
-                #    "best" directory, overwriting the previous best each time.
-                best_dir = output_dir / "best"
-                if best_dir.exists():
-                    shutil.rmtree(best_dir)
-                save_checkpoint(best_dir, step, policy, optimizer)
-
-                if wandb is not None:
-                    # Overwrite/refresh the "best" artifact so that the most recent best checkpoint is easy to retrieve
-                    art_best = wandb.Artifact(name=f"run_{wandb.run.id}_best", type="model")
-                    art_best.add_dir(str(best_dir))
-                    wandb.log_artifact(art_best, aliases=["best", "latest"])
 
     logger.info(colored("Training finished!", "green", attrs=["bold"]))
     if wandb is not None:
@@ -932,17 +916,18 @@ if __name__ == "__main__":
     """
     Example commands:
 
-    DexMimicGen/MimicGen/Robomimic environment training with high-resolution video recording and parallel environments:
+    PCA spectrum eval runs at step 0 and at every checkpoint (--save_freq, default 1000):
+    20 env rollouts → action-chunk PCA → wandb.Image at spectrum/eval_step_{step}.
 
-    # Production mode (default): uses asynchronous multiprocessing for faster evaluation
     python -m resfit.lerobot.scripts.train_bc_dexmg \
         --dataset ankile/dexmimicgen-coffee-v1 \
         --policy act \
         --batch_size 64 --num_workers 8 \
-        --wandb_project dexmimicgen-test \
-        --rollout_freq 1000 --eval_env TwoArmCoffee \
+        --wandb_enable --wandb_project dexmimicgen-test \
+        --eval_env TwoArmCoffee \
         --eval_num_envs 8 \
         --eval_num_episodes 20 \
+        --save_freq 1000 \
         --eval_camera_size 84 --eval_render_size 224
 
     # Debug mode: uses synchronous environments for easier debugging with ipdb
@@ -950,8 +935,8 @@ if __name__ == "__main__":
         --dataset ankile/dexmimicgen-coffee-v1 \
         --policy act \
         --batch_size 64 --num_workers 8 \
-        --wandb_project dexmimicgen-test \
-        --rollout_freq 1000 --eval_env TwoArmCoffee \
+        --wandb_enable --wandb_project dexmimicgen-test \
+        --eval_env TwoArmCoffee \
         --eval_num_envs 4 \
         --eval_num_episodes 12 \
         --eval_camera_size 84 --eval_render_size 224 \
@@ -962,62 +947,7 @@ if __name__ == "__main__":
         --dataset ankile/dexmimicgen-coffee-v1 \
         --policy act \
         --batch_size 64 --num_workers 8 \
-        --wandb_project dexmimicgen-test \
+        --wandb_enable --wandb_project dexmimicgen-test \
         --disable_proprioceptive_obs
-
-    IMPORTANT: Parallel Environment Implementation
-    =============================================
-
-    This script supports two modes for running evaluation rollouts:
-
-    1. **Production Mode (default)**: Uses AsyncVecEnv with multiprocessing
-       - Environments run in separate processes for maximum parallelization
-       - Faster evaluation but harder to debug
-       - Recommended for training runs
-
-    2. **Debug Mode (--debug flag)**: Uses SyncVecEnv
-       - Environments run sequentially in the main process
-       - Easier to debug with ipdb and breakpoints
-       - Recommended for development and debugging
-
-    The --eval_num_envs argument controls how many parallel environments to use:
-    - Higher values = faster evaluation but more memory usage
-    - Recommended: 4-8 for most setups
-    - Use lower values (2-4) in debug mode to reduce complexity
-
-    The --eval_num_episodes argument controls the total number of episodes to evaluate:
-    - More episodes = better statistics but longer evaluation time
-    - Recommended: 10-20 for development, 50+ for final evaluation
-    - Episodes will be distributed across the parallel environments
-
-    IMPORTANT: Observation Space Alignment
-    =====================================
-    1. Image dimensions: --eval_camera_size should match your dataset
-       (e.g., 84 for 84x84 images, 224 for 224x224 images)
-
-    2. High-resolution video recording: --eval_render_size adds an additional
-       high-resolution camera using Robosuite's native multi-camera support.
-       The policy still evaluates on standard resolution, but videos are captured
-       at higher resolution for better visualization:
-       - --eval_camera_size 84 --eval_render_size 224 for policy on 84x84, videos at 224x224
-       - --eval_camera_size 84 --eval_render_size 448 for policy on 84x84, videos at 448x448
-       If --eval_render_size equals --eval_camera_size, no additional camera is created.
-
-       The system automatically selects an appropriate high-viewpoint camera (like
-       'frontview' or 'birdview') for video recording while keeping dataset cameras
-       at standard resolution for policy evaluation.
-
-    3. Image keys: The rollout environment automatically uses the same
-       cameras as your dataset conversion:
-       - Panda envs: agentview, robot0_eye_in_hand, robot1_eye_in_hand
-       - Transport: adds shouldercamera0, shouldercamera1
-       - Humanoid: agentview, robot0_eye_in_left_hand, robot0_eye_in_right_hand
-       - Can sort: frontview, robot0_eye_in_left_hand, robot0_eye_in_right_hand
-
-       When --eval_render_size > --eval_camera_size, an additional high-resolution
-       camera (e.g., frontview or birdview) is automatically selected and used for video recording.
-
-    4. State observations: Uses end-effector poses, quaternions, and gripper
-       positions (same as dataset conversion), NOT joint positions.
     """
-    main(args_cli)
+    main(parser.parse_args())

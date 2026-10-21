@@ -58,6 +58,18 @@ def main() -> None:
     parser.add_argument("--num_episodes", type=int, default=20)
     parser.add_argument("--output", type=str, default=None, help="Output mp4 path (default: next to ckpt)")
     parser.add_argument("--no_video", action="store_true", help="Skip MP4 recording")
+    parser.add_argument(
+        "--n_action_steps",
+        type=int,
+        default=None,
+        help="Override ACT open-loop chunk length before replan. Defaults to the checkpoint value.",
+    )
+    parser.add_argument(
+        "--result",
+        type=str,
+        default=None,
+        help="Write final success-rate summary here. Also writes sibling .progress during the run.",
+    )
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--camera_size", type=int, default=84, help="Policy camera size (must match training)")
     parser.add_argument("--render_size", type=int, default=224, help="Video render resolution")
@@ -108,8 +120,35 @@ def main() -> None:
     device = torch.device(args.device)
     logger.info("Loading policy from %s", policy_dir)
     policy = load_policy(policy_dir)
+    native_n_action_steps = int(policy.config.n_action_steps)
+    if args.n_action_steps is not None:
+        if args.n_action_steps <= 0 or args.n_action_steps > int(policy.config.chunk_size):
+            raise ValueError(
+                f"n_action_steps={args.n_action_steps} must be in [1, chunk_size={policy.config.chunk_size}]"
+            )
+        policy.config.n_action_steps = int(args.n_action_steps)
     policy.to(device)
     policy.eval()
+    logger.info(
+        "ACT chunk_size=%d n_action_steps=%d (checkpoint native=%d)",
+        int(policy.config.chunk_size),
+        int(policy.config.n_action_steps),
+        native_n_action_steps,
+    )
+
+    result_path = Path(args.result).expanduser().resolve() if args.result else None
+    progress_path = None
+    if result_path is not None:
+        result_path.parent.mkdir(parents=True, exist_ok=True)
+        progress_path = result_path.with_suffix(".progress")
+        progress_path.write_text("")
+
+    def emit(message: str) -> None:
+        logger.info(message)
+        if progress_path is not None:
+            with progress_path.open("a") as handle:
+                handle.write(message + "\n")
+                handle.flush()
 
     logger.info("Creating sync eval env %s (1 env, no multiprocessing)", args.env)
     env = create_vectorized_env(
@@ -157,9 +196,13 @@ def main() -> None:
     episode_step = 0
 
     if out_path is None:
-        logger.info("Running %d episodes (no video)", args.num_episodes)
+        emit(f"Running {args.num_episodes} episodes (no video)")
     else:
-        logger.info("Running %d episodes -> %s", args.num_episodes, out_path)
+        emit(f"Running {args.num_episodes} episodes -> {out_path}")
+    emit(
+        f"start env={args.env} n_action_steps={policy.config.n_action_steps} "
+        f"ckpt={ckpt_path}"
+    )
     while done_episodes < args.num_episodes:
         with torch.inference_mode():
             action = policy.select_action(obs)
@@ -168,6 +211,11 @@ def main() -> None:
             writer.append_data(env.render()[0])
         episode_step += 1
         total_steps += 1
+        if episode_step == 1 or episode_step % 50 == 0:
+            emit(
+                f"episode {done_episodes:03d} step {episode_step:03d} "
+                f"running={successes}/{done_episodes}"
+            )
 
         done = bool((terminated | truncated)[0].item())
         if not done:
@@ -176,12 +224,10 @@ def main() -> None:
         is_success = bool(reward[0].item() == 1.0)
         done_episodes += 1
         successes += int(is_success)
-        logger.info(
-            "Episode %d/%d: %s (%d steps)",
-            done_episodes,
-            args.num_episodes,
-            "SUCCESS" if is_success else "FAIL",
-            episode_step,
+        emit(
+            f"episode {done_episodes - 1:03d}: "
+            f"{'SUCCESS' if is_success else 'FAIL'} "
+            f"len={episode_step} running={successes}/{done_episodes}"
         )
         policy.reset()
         episode_step = 0
@@ -192,15 +238,26 @@ def main() -> None:
 
     elapsed = time.perf_counter() - t0
     success_rate = successes / done_episodes if done_episodes else 0.0
-    logger.info(
-        "Done: %d/%d success (%.1f%%) | %d steps in %.1fs%s",
-        successes,
-        done_episodes,
-        100 * success_rate,
-        total_steps,
-        elapsed,
-        f" | video: {out_path}" if out_path is not None else "",
+    summary_lines = [
+        f"checkpoint: {ckpt_path}",
+        f"env: {args.env}",
+        f"episodes: {done_episodes}",
+        f"n_action_steps: {int(policy.config.n_action_steps)}",
+        f"chunk_size: {int(policy.config.chunk_size)}",
+        f"success_rate: {success_rate:.4f} ({successes}/{done_episodes})",
+        f"total_steps: {total_steps}",
+        f"elapsed_sec: {elapsed:.1f}",
+    ]
+    summary = "\n".join(summary_lines)
+    emit(
+        f"Done: {successes}/{done_episodes} success ({100 * success_rate:.1f}%) | "
+        f"{total_steps} steps in {elapsed:.1f}s"
+        + (f" | video: {out_path}" if out_path is not None else "")
     )
+    emit(summary)
+    if result_path is not None:
+        result_path.write_text(summary + "\n")
+        emit(f"Wrote {result_path}")
 
     if wandb_run is not None:
         log = {

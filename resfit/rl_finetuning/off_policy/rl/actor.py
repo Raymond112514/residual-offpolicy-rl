@@ -2,6 +2,8 @@
 
 # SPDX-License-Identifier: CC-BY-NC-4.0
 
+from __future__ import annotations
+
 import torch
 from torch import nn
 
@@ -9,7 +11,16 @@ from resfit.rl_finetuning.config.rlpd import ActorConfig
 from resfit.rl_finetuning.off_policy.common_utils import utils
 
 
-def build_fc(in_dim, hidden_dim, action_dim, num_layer, layer_norm, dropout, use_layer_norm=True):
+def build_fc(
+    in_dim,
+    hidden_dim,
+    action_dim,
+    num_layer,
+    layer_norm,
+    dropout,
+    use_layer_norm=True,
+    squash: str = "tanh",
+):
     dims = [in_dim]
     dims.extend([hidden_dim for _ in range(num_layer)])
 
@@ -24,7 +35,10 @@ def build_fc(in_dim, hidden_dim, action_dim, num_layer, layer_norm, dropout, use
         layers.append(nn.ReLU())
 
     layers.append(nn.Linear(dims[-1], action_dim))
-    layers.append(nn.Tanh())
+    if squash == "tanh":
+        layers.append(nn.Tanh())
+    elif squash != "gaussian":
+        raise ValueError(f"Unknown actor squash={squash!r}; expected 'tanh' or 'gaussian'")
     return nn.Sequential(*layers)
 
 
@@ -66,16 +80,26 @@ class SpatialEmb(nn.Module):
 
 
 class Actor(nn.Module):
-    def __init__(self, repr_dim, patch_repr_dim, prop_dim, action_dim, cfg: ActorConfig, residual_actor: bool = False):
+    def __init__(
+        self,
+        repr_dim,
+        patch_repr_dim,
+        prop_dim,
+        action_dim,
+        cfg: ActorConfig,
+        residual_actor: bool = False,
+        base_action_dim: int | None = None,
+    ):
         super().__init__()
 
         self.prop_dim = prop_dim
         self.residual_actor = residual_actor
         self.cfg = cfg
+        self.base_action_dim = base_action_dim if base_action_dim is not None else action_dim
 
         if residual_actor:
-            # The residual actor takes the base action as input alongside the state
-            self.prop_dim += action_dim
+            # The residual actor takes the base action as input alongside the state.
+            self.prop_dim += self.base_action_dim
 
         if cfg.spatial_emb > 0:
             assert cfg.spatial_emb > 1, "this is the dimension"
@@ -100,6 +124,11 @@ class Actor(nn.Module):
         if self.prop_dim > 0:
             policy_in_dim += self.prop_dim
 
+        squash = str(getattr(cfg, "squash", "tanh"))
+        if squash not in ("tanh", "gaussian"):
+            raise ValueError(f"Unknown actor squash={squash!r}; expected 'tanh' or 'gaussian'")
+        self.squash = squash
+
         # Create policy network
         self.policy = build_fc(
             policy_in_dim,
@@ -109,6 +138,7 @@ class Actor(nn.Module):
             layer_norm=1,
             dropout=cfg.dropout,
             use_layer_norm=cfg.use_layer_norm,
+            squash=self.squash,
         )
 
         # Apply weight initialization
@@ -161,7 +191,8 @@ class Actor(nn.Module):
             all_input.append(prop)
             if self.residual_actor:
                 # The residual actor takes the base action as input alongside the state
-                all_input.append(obs["observation.base_action"])
+                base_action = obs["observation.base_action"]
+                all_input.append(base_action.reshape(base_action.shape[0], -1))
 
         policy_input = torch.cat(all_input, dim=-1)
 
@@ -171,7 +202,8 @@ class Actor(nn.Module):
         # NOTE: std is already in environment action space (more interpretable)
         scaled_mu = mu * self.cfg.action_scale
 
-        # Create distribution with scaled mean but environment-scale std
-        action_dist = utils.TruncatedNormal(scaled_mu, std)
+        # tanh: last-layer Tanh + TruncatedNormal in [-1, 1]
+        # gaussian: unsquashed Normal (latents / residuals are not box-bounded)
+        action_dist = utils.TruncatedNormal(scaled_mu, std, clamp=self.squash == "tanh")
 
         return action_dist  # noqa: RET504

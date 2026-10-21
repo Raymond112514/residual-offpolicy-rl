@@ -179,9 +179,11 @@ def run_dexmg_evaluation(
             obs_q = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in obs.items()}
             obs_q["feat"] = agent._encode(obs_q, augment=False)
 
-            # For Q-value computation, use combined action and clamp to [-1, 1] (consistent with training)
-            if agent.residual_actor:
-                q_actions = torch.clamp(obs["observation.base_action"] + actions, -1.0, 1.0)
+            # Match training: residual Q uses actor output; executed Q uses clip(base+delta)
+            if getattr(agent, "residual_actor", False):
+                q_actions = agent.to_critic_action(
+                    actions, obs["observation.base_action"], obs.get("observation.vae_state")
+                )
 
             q_pred = (
                 agent.critic.q_value(obs_q["feat"], obs_q["observation.state"], q_actions).detach().cpu().squeeze(-1)

@@ -87,6 +87,8 @@ class ActorConfig:
     # L2 regularization weight on action magnitude
     action_l2_reg_weight: float = 0.0
     action_scale: float = 1.0
+    # Policy output: "tanh" (bounded + truncated Normal) or "gaussian" (unsquashed).
+    squash: str = "tanh"
     # Number of hidden layers in the actor MLP (default 2 for backwards compatibility)
     num_layers: int = 2
     # Layer normalization control

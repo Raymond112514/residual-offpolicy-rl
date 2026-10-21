@@ -151,7 +151,16 @@ def clip_action_norm(action, max_norm):
 
 
 class TruncatedNormal(pyd.Normal):
-    def __init__(self, loc, scale, low=-1.0, high=1.0, eps=1e-6, max_action_norm: float = -1):
+    def __init__(
+        self,
+        loc,
+        scale,
+        low=-1.0,
+        high=1.0,
+        eps=1e-6,
+        max_action_norm: float = -1,
+        clamp: bool = True,
+    ):
         if isinstance(scale, float):
             scale = torch.ones_like(loc) * scale
 
@@ -160,6 +169,7 @@ class TruncatedNormal(pyd.Normal):
         self.high = high
         self.eps = eps
         self.max_action_norm = max_action_norm
+        self.clamp = bool(clamp)
 
     def _clamp(self, x):
         clamped_x = torch.clamp(x, self.low + self.eps, self.high - self.eps)
@@ -175,7 +185,8 @@ class TruncatedNormal(pyd.Normal):
         if clip is not None:
             eps = torch.clamp(eps, -clip, clip)
         x = self.loc + eps
-        x = self._clamp(x)
+        if self.clamp:
+            x = self._clamp(x)
         if self.max_action_norm > 0:
             x = clip_action_norm(x, self.max_action_norm)
         return x

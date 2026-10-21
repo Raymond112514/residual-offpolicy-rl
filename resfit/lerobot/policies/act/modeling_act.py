@@ -219,6 +219,21 @@ class ACTPolicy(PreTrainedPolicy):
         return torch.stack(actions_to_execute, dim=0)
 
     @torch.no_grad
+    def predict_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
+        """Infer a full action chunk without using the per-step execution queue.
+
+        Returns (B, n_action_steps, action_dim) in environment action units.
+        """
+        self.eval()
+        batch = self.normalize_inputs(batch)
+        if self.config.image_features:
+            batch = dict(batch)
+            batch["observation.images"] = [batch[key] for key in self.config.image_features]
+        n_steps = self.config.n_action_steps
+        actions_seq = self.model(batch)[0][:, :n_steps]
+        return self.unnormalize_outputs({"action": actions_seq})["action"]
+
+    @torch.no_grad
     def select_action_normalized(self, batch: dict[str, Tensor]) -> Tensor:
         """Select a single action given environment observations.
 

@@ -10,6 +10,7 @@ from contextlib import contextmanager
 import torch
 from torch import nn
 
+from resfit.rl_finetuning.autoencoder.action_ae import ResidualActionAE
 from resfit.rl_finetuning.config.rlpd import QAgentConfig
 from resfit.rl_finetuning.off_policy import common_utils
 from resfit.rl_finetuning.off_policy.common_utils import utils
@@ -27,6 +28,13 @@ class QAgent(nn.Module):
         rl_cameras: list[str] | str,
         cfg: QAgentConfig,
         residual_actor: bool = False,
+        combine_residual_with_base: bool | None = None,
+        critic_on_residual: bool = False,
+        base_action_dim: int | None = None,
+        pca_basis: torch.Tensor | None = None,
+        pca_reg_basis: torch.Tensor | None = None,
+        pca_subspace_reg_weight: float = 0.0,
+        vae_decoder: ResidualActionAE | None = None,
     ):
         """Initialize the Q-agent.
 
@@ -46,6 +54,10 @@ class QAgent(nn.Module):
             is to pass a list of camera names.
         cfg : QAgentConfig
             Hyper-parameter configuration dataclass.
+        critic_on_residual : bool
+            If True, Q takes the actor residual (PCA/VAE coords if a latent
+            decoder is set, otherwise the window/step residual). If False, Q
+            takes the executed action ``clip(base + decode(residual))``.
         """
         super().__init__()
         # Normalise *rl_cameras* to a list for unified processing
@@ -56,6 +68,26 @@ class QAgent(nn.Module):
         self.rl_cameras = rl_cameras
         self.cfg = cfg
         self.residual_actor = residual_actor
+        self.combine_residual_with_base = residual_actor if combine_residual_with_base is None else combine_residual_with_base
+        self.critic_on_residual = bool(critic_on_residual)
+        if pca_basis is not None and vae_decoder is not None:
+            raise ValueError("pca_basis and vae_decoder cannot be used together")
+        if pca_basis is not None:
+            self.register_buffer("pca_basis", pca_basis.detach().float())
+        else:
+            self.pca_basis = None
+        if pca_reg_basis is not None:
+            self.register_buffer("pca_reg_basis", pca_reg_basis.detach().float())
+        else:
+            self.pca_reg_basis = None
+        self.pca_subspace_reg_weight = float(pca_subspace_reg_weight)
+        if vae_decoder is not None:
+            self.vae_decoder = vae_decoder
+            self.vae_decoder.eval()
+            for p in self.vae_decoder.parameters():
+                p.requires_grad_(False)
+        else:
+            self.vae_decoder = None
 
         # Build the per-camera encoders *after* `self.rl_cameras` is defined so
         # that the helper function can iterate over them.
@@ -75,15 +107,25 @@ class QAgent(nn.Module):
         assert len(prop_shape) == 1
         prop_dim = prop_shape[0] if cfg.use_prop else 0
 
+        executed_dim = base_action_dim if base_action_dim is not None else action_dim
+        critic_action_dim = action_dim if self.critic_on_residual else executed_dim
         # create critics & actor
         self.critic = Critic(
             repr_dim=repr_dim,
             patch_repr_dim=patch_repr_dim,
             prop_dim=prop_dim,
-            action_dim=action_dim,
+            action_dim=critic_action_dim,
             cfg=self.cfg.critic,
         )
-        self.actor = Actor(repr_dim, patch_repr_dim, prop_dim, action_dim, cfg.actor, residual_actor=residual_actor)
+        self.actor = Actor(
+            repr_dim,
+            patch_repr_dim,
+            prop_dim,
+            action_dim,
+            cfg.actor,
+            residual_actor=residual_actor,
+            base_action_dim=base_action_dim,
+        )
 
         self.critic_target = copy.deepcopy(self.critic)
         self.actor_target = copy.deepcopy(self.actor)
@@ -299,6 +341,22 @@ class QAgent(nn.Module):
 
         return action
 
+    def to_critic_action(
+        self, residual: torch.Tensor, base_action: torch.Tensor, state: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        if self.critic_on_residual:
+            return residual
+        delta = residual
+        if self.vae_decoder is not None:
+            delta = self.vae_decoder(residual, state)
+        elif self.pca_basis is not None:
+            P = self.pca_basis.to(device=residual.device, dtype=residual.dtype)
+            delta = residual @ P
+        if self.combine_residual_with_base:
+            base = base_action.reshape(residual.shape[0], -1)
+            return torch.clamp(base + delta, -1.0, 1.0)
+        return delta
+
     def update_critic(
         self,
         obs: dict[str, torch.Tensor],
@@ -313,7 +371,7 @@ class QAgent(nn.Module):
             # use train mode as we use actor dropout
             assert self.actor_target.training
 
-            # Predict next residual action and form the combined next action
+            # Predict next residual action and map it into the critic action space
             # Use target_action_noise config to control whether to add noise to target actions
             next_residual_action = self._act_default(
                 obs=next_obs,
@@ -322,13 +380,11 @@ class QAgent(nn.Module):
                 clip=self.cfg.stddev_clip,
                 use_target=True,
             )
-
-            if self.residual_actor:
-                # Current step: 'action' from the replay buffer is the executed combined action
-                # Next step: combine and clamp to match environment execution
-                next_action = torch.clamp(next_obs["observation.base_action"] + next_residual_action, -1.0, 1.0)
-            else:
-                next_action = next_residual_action
+            next_action = self.to_critic_action(
+                next_residual_action,
+                next_obs["observation.base_action"],
+                next_obs.get("observation.vae_state"),
+            )
 
             # Compute target Q using min over a random subset of 2 heads
             target_all = self.critic_target.q_value(next_obs["feat"], next_obs["observation.state"], next_action)
@@ -437,19 +493,22 @@ class QAgent(nn.Module):
         # Add L2 regularization on action magnitude (before we add the residual action to the base)
         action_l2_penalty = self.cfg.actor.action_l2_reg_weight * torch.mean(torch.sum(action_pred**2, dim=-1))
 
-        if self.residual_actor:
-            # Create the full action by combining the base action and the residual action
-            # and clamp to the valid range [-1, 1] to match environment execution
-            combined_action = torch.clamp(obs["observation.base_action"] + action_pred, -1.0, 1.0)
-        else:
-            combined_action = action_pred
+        pca_subspace_penalty = action_pred.new_zeros(())
+        if self.pca_subspace_reg_weight > 0.0 and self.pca_reg_basis is not None:
+            z = action_pred @ self.pca_reg_basis.T
+            delta_orth = action_pred - z @ self.pca_reg_basis
+            pca_subspace_penalty = self.pca_subspace_reg_weight * torch.mean(torch.sum(delta_orth**2, dim=-1))
+
+        combined_action = self.to_critic_action(
+            action_pred, obs["observation.base_action"], obs.get("observation.vae_state")
+        )
 
         q = self.critic.q_value_for_policy(obs["feat"], obs["observation.state"], combined_action)
         actor_loss_base = -q.mean()
 
-        actor_loss_total = actor_loss_base + action_l2_penalty
+        actor_loss_total = actor_loss_base + action_l2_penalty + pca_subspace_penalty
 
-        return actor_loss_total, actor_loss_base, combined_action, action_pred, action_l2_penalty
+        return actor_loss_total, actor_loss_base, combined_action, action_pred, action_l2_penalty, pca_subspace_penalty
 
     def _compute_actor_bc_loss(self, batch, *, backprop_encoder):
         assert not self.residual_actor, "Not implemented"
@@ -483,6 +542,7 @@ class QAgent(nn.Module):
             combined_action,
             action_pred,
             action_l2_penalty,
+            pca_subspace_penalty,
         ) = self._compute_actor_loss(obs, stddev)
 
         metrics["train/actor_loss_base"] = actor_loss_base.item()
@@ -495,6 +555,8 @@ class QAgent(nn.Module):
         # Log L2 regularization penalty if applied
         if self.cfg.actor.action_l2_reg_weight > 0:
             metrics["train/actor_l2_penalty"] = action_l2_penalty.item()
+        if self.pca_subspace_reg_weight > 0.0:
+            metrics["train/pca_subspace_penalty"] = pca_subspace_penalty.item()
 
         self.actor_opt.zero_grad(set_to_none=True)
         actor_loss_total.backward()
@@ -525,6 +587,7 @@ class QAgent(nn.Module):
             combined_action,
             action_pred,
             action_l2_penalty,
+            pca_subspace_penalty,
         ) = self._compute_actor_loss(obs, stddev)
 
         metrics["train/actor_loss_base"] = actor_loss_base.item()
@@ -537,6 +600,8 @@ class QAgent(nn.Module):
         # Log L2 regularization penalty if applied
         if self.cfg.actor.action_l2_reg_weight > 0:
             metrics["train/actor_l2_penalty"] = action_l2_penalty.item()
+        if self.pca_subspace_reg_weight > 0.0:
+            metrics["train/pca_subspace_penalty"] = pca_subspace_penalty.item()
 
         # Use config option to control whether BC loss updates encoder
         bc_backprop_encoder = self.cfg.bc_backprop_encoder

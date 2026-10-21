@@ -42,6 +42,38 @@ class BasePolicyConfig:
 
 
 @dataclass
+class ChunkResidualConfig:
+    """Open-loop residual over a window of an ACT action chunk.
+
+    horizon must divide ACT n_action_steps
+    use_pca=False: actor outputs flattened residual (horizon * act_dim).
+    use_pca=True: actor outputs k coords; residual = z @ P.
+    use_vae=True: actor outputs k VAE latents; residual = decoder(z) * std
+    (no mean: residual mean is 0). Trained on action chunks, not X-X' diffs.
+    vae_condition_on_state: decoder also takes the query-time proprio vector.
+    pca_subspace_reg_weight>0: keep full residual; penalize ||δ - P^T P δ||^2.
+    use_pca / use_vae / subspace-reg are mutually exclusive.
+    """
+
+    enabled: bool = False
+    use_pca: bool = False
+    use_vae: bool = False
+    k: int = 8
+    horizon: int = 20
+    pca_path: str | None = None
+    pca_fit_episodes: int = 20
+    pca_subspace_reg_weight: float = 0.0
+    # SERL-style AE/VAE (same MLP as robomimic). Used when use_vae=True.
+    vae: bool = True
+    vae_path: str | None = None
+    vae_beta: float = 1e-3
+    vae_condition_on_state: bool = False
+    vae_epochs: int = 20
+    vae_lr: float = 1e-3
+    vae_batch_size: int = 256
+
+
+@dataclass
 class ResidualTD3AlgoConfig(RLPDAlgoConfig):
     # ------------------------------------------------------------------
     # Critic warmup phase ----------------------------------------------
@@ -72,6 +104,15 @@ class ResidualTD3AlgoConfig(RLPDAlgoConfig):
     # Progressive clipping schedule for the residual actions
     # I.e., starts clipping linearly from 0 to action scale over progressive_clipping_steps steps
     progressive_clipping_steps: int = 0
+
+    # False: Q(s, clip(base+delta)) in executed action space.
+    # True: Q(s, residual) in actor action space (PCA/VAE coords if latent, else window residual).
+    critic_on_residual: bool = False
+
+    # ------------------------------------------------------------------
+    # Chunk residual (PCA or VAE coordinates over an ACT action chunk)
+    # ------------------------------------------------------------------
+    chunk_residual: ChunkResidualConfig = field(default_factory=ChunkResidualConfig)
 
 
 # -----------------------------------------------------------------------------

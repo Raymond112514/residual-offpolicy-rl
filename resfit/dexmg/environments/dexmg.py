@@ -654,6 +654,16 @@ def create_vectorized_env(
             render_gpu_device_id = visible_device_ids[0] if visible_device_ids else 0
         env_fns.append(make_dexmimicgen_env(env_name, camera_size, render_size, render_gpu_device_id, env_id))
 
+    # Spawn workers re-import __main__ with sys.path[0] = the script dir, not
+    # the repo root. Put the repo on PYTHONPATH so `import resfit` works.
+    _repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+    _py_path = os.environ.get("PYTHONPATH", "")
+    if _repo_root not in _py_path.split(os.pathsep):
+        os.environ["PYTHONPATH"] = f"{_repo_root}{os.pathsep}{_py_path}" if _py_path else _repo_root
+
+    # Children inherit this so `python -m` + spawn does not re-enter train_bc_dexmg.main().
+    os.environ["RESFIT_MP_WORKER"] = "1"
+
     if debug:
         # Use synchronous vectorized environment for debugging
         logger.debug("Debug mode: using gymnasium.vector.SyncVectorEnv")

@@ -59,11 +59,24 @@ from resfit.rl_finetuning.utils.hugging_face import (
 from resfit.rl_finetuning.utils.normalization import ActionScaler, StateStandardizer
 from resfit.rl_finetuning.utils.rb_transforms import MultiStepTransform
 from resfit.rl_finetuning.wrappers.residual_env_wrapper import BasePolicyVecEnvWrapper
+from resfit.rl_finetuning.wrappers.chunk_residual_wrapper import (
+    ChunkResidualVecEnvWrapper,
+    fit_or_load_act_chunk_pca,
+    fit_or_load_act_chunk_vae,
+)
 
 
 # -----------------------------------------------------------------------------
 # Timing utility --------------------------------------------------------------
 # -----------------------------------------------------------------------------
+def _info_env_steps(info: dict, default: int) -> int:
+    """Physics steps taken by the last env.step (chunk wrapper sets chunk_env_steps)."""
+    value = info.get("chunk_env_steps", default) if isinstance(info, dict) else default
+    if torch.is_tensor(value):
+        value = value.reshape(-1)[0].item()
+    return int(value)
+
+
 class TrainingTimer:
     """Simple timing utility for measuring training stage proportions."""
 
@@ -319,11 +332,14 @@ def main(cfg: ResidualTD3DexmgConfig):
         debug: bool,
         action_scaler: ActionScaler,
         state_standardizer: StateStandardizer,
+        pca_basis: torch.Tensor | None = None,
+        vae_decoder=None,
+        act_chunk_size: int | None = None,
+        residual_horizon: int | None = None,
     ):
         assert action_scaler is not None, "action_scaler must be provided for consistent normalization"
         assert state_standardizer is not None, "state_standardizer must be provided for consistent normalization"
 
-        # Create the vectorized environment
         vec_env = create_vectorized_env(
             env_name=env_name,
             num_envs=num_envs,
@@ -331,8 +347,18 @@ def main(cfg: ResidualTD3DexmgConfig):
             video_key=video_key,
             debug=debug,
         )
-
-        # Wrap it with the base policy wrapper
+        if residual_horizon is not None:
+            assert act_chunk_size is not None
+            return ChunkResidualVecEnvWrapper(
+                vec_env=vec_env,
+                base_policy=base_policy,
+                action_scaler=action_scaler,
+                state_standardizer=state_standardizer,
+                act_chunk_size=act_chunk_size,
+                horizon=residual_horizon,
+                pca_basis=pca_basis,
+                vae_decoder=vae_decoder,
+            )
         return BasePolicyVecEnvWrapper(
             vec_env=vec_env,
             base_policy=base_policy,
@@ -360,23 +386,159 @@ def main(cfg: ResidualTD3DexmgConfig):
 
     print(f"Set random seed to {cfg.seed}")
 
+    chunk_cfg = getattr(cfg.algo, "chunk_residual", None)
+    chunk_enabled = bool(chunk_cfg is not None and chunk_cfg.enabled)
+    use_pca = bool(chunk_enabled and getattr(chunk_cfg, "use_pca", False))
+    use_vae = bool(chunk_enabled and getattr(chunk_cfg, "use_vae", False))
+    pca_subspace_reg_weight = float(getattr(chunk_cfg, "pca_subspace_reg_weight", 0.0)) if chunk_enabled else 0.0
+    if use_pca and use_vae:
+        raise ValueError("use_pca and use_vae cannot be used together")
+    vae_condition_on_state = bool(getattr(chunk_cfg, "vae_condition_on_state", False))
+    if vae_condition_on_state and not use_vae:
+        raise ValueError("vae_condition_on_state requires use_vae")
+    if use_pca and pca_subspace_reg_weight > 0.0:
+        raise ValueError("use_pca and pca_subspace_reg_weight cannot be used together")
+    if use_vae and pca_subspace_reg_weight > 0.0:
+        raise ValueError("use_vae and pca_subspace_reg_weight cannot be used together")
+    act_chunk_size = int(getattr(base_policy.config, "n_action_steps", 20))
+    residual_horizon = int(getattr(chunk_cfg, "horizon", act_chunk_size)) if chunk_enabled else act_chunk_size
+    pca_basis = None
+    vae_decoder = None
+    if chunk_enabled:
+        if residual_horizon <= 0 or act_chunk_size % residual_horizon != 0:
+            raise ValueError(
+                f"chunk_residual.horizon={residual_horizon} must be a positive divisor of "
+                f"ACT n_action_steps={act_chunk_size}"
+            )
+        print(
+            f"Chunk residual enabled: use_pca={use_pca}, use_vae={use_vae}, k={chunk_cfg.k}, "
+            f"act_chunk={act_chunk_size}, horizon={residual_horizon}, pca_path={chunk_cfg.pca_path}, "
+            f"vae_path={getattr(chunk_cfg, 'vae_path', None)}, "
+            f"pca_subspace_reg_weight={pca_subspace_reg_weight}, "
+            f"actor_squash={getattr(cfg.agent.actor, 'squash', 'tanh')}"
+        )
+        if residual_horizon != 1 and cfg.algo.n_step != 1:
+            print(f"chunk residual: forcing n_step=1 (was {cfg.algo.n_step})")
+            with open_dict(cfg.algo):
+                cfg.algo.n_step = 1
+        if cfg.algo.offline_fraction > 0.0:
+            print("chunk residual: forcing offline_fraction=0.0 (chunk transitions != 1-step demos)")
+            with open_dict(cfg.algo):
+                cfg.algo.offline_fraction = 0.0
+        if cfg.eval_num_envs != 1:
+            print("chunk residual: forcing eval_num_envs=1")
+            cfg.eval_num_envs = 1
+
     # ---------------------------------------------------------------------
     # Environment setup ----------------------------------------------------
     # ---------------------------------------------------------------------
     assert cfg.num_envs == 1, "Only support 1 environment for now because of how n_step is implemented"
-    env = get_envs(
-        env_name=cfg.task,
-        num_envs=cfg.num_envs,
-        base_policy=base_policy,
-        device=device_str,
-        video_key=cfg.video_key,
-        debug=cfg.debug,
-        action_scaler=action_scaler,
-        state_standardizer=state_standardizer,
-    )
+
+    wrap_kwargs = {}
+    if chunk_enabled:
+        train_vec = create_vectorized_env(
+            env_name=cfg.task,
+            num_envs=cfg.num_envs,
+            device=device_str,
+            video_key=cfg.video_key,
+            debug=cfg.debug,
+        )
+        need_pca = use_pca or pca_subspace_reg_weight > 0.0
+        if need_pca:
+            pca_basis = fit_or_load_act_chunk_pca(
+                vec_env=train_vec,
+                base_policy=base_policy,
+                action_scaler=action_scaler,
+                act_chunk_size=act_chunk_size,
+                horizon=residual_horizon,
+                k=int(chunk_cfg.k),
+                pca_path=chunk_cfg.pca_path,
+                pca_fit_episodes=int(chunk_cfg.pca_fit_episodes),
+                device=device,
+            )
+            pca_out = Path(os.environ.get("CACHE_DIR", ".")) / (
+                f"act_chunk_pca_{cfg.task}_h{residual_horizon}_k{int(chunk_cfg.k)}_seed{cfg.seed}.npz"
+            )
+            pca_out.parent.mkdir(parents=True, exist_ok=True)
+            np.savez_compressed(pca_out, components=pca_basis.detach().cpu().numpy())
+            print(f"Wrote {pca_out} (scaled-space PCs, residual = z @ P, no mean)")
+        if use_vae:
+            vae_decoder = fit_or_load_act_chunk_vae(
+                vec_env=train_vec,
+                base_policy=base_policy,
+                action_scaler=action_scaler,
+                act_chunk_size=act_chunk_size,
+                horizon=residual_horizon,
+                k=int(chunk_cfg.k),
+                vae_path=getattr(chunk_cfg, "vae_path", None),
+                pca_fit_episodes=int(chunk_cfg.pca_fit_episodes),
+                device=device,
+                vae=bool(getattr(chunk_cfg, "vae", True)),
+                beta=float(getattr(chunk_cfg, "vae_beta", 1e-3)),
+                epochs=int(getattr(chunk_cfg, "vae_epochs", 20)),
+                lr=float(getattr(chunk_cfg, "vae_lr", 1e-3)),
+                batch_size=int(getattr(chunk_cfg, "vae_batch_size", 256)),
+                seed=int(cfg.seed),
+                condition_on_state=vae_condition_on_state,
+                state_standardizer=state_standardizer,
+            )
+            vae_kind = "vae" if vae_decoder.vae else "ae"
+            beta_tag = f"{vae_decoder.beta:g}".replace("-", "m")
+            cond_tag = "_scond" if vae_decoder.condition_on_state else ""
+            vae_out = Path(os.environ.get("CACHE_DIR", ".")) / (
+                f"act_chunk_{vae_kind}_{cfg.task}_h{residual_horizon}_k{int(chunk_cfg.k)}"
+                f"_beta{beta_tag}_ep{int(vae_decoder.epochs)}{cond_tag}_seed{cfg.seed}.pt"
+            )
+            vae_out.parent.mkdir(parents=True, exist_ok=True)
+            vae_decoder.save(str(vae_out))
+            cond_note = (
+                f", conditioned on state dim {vae_decoder.cond_dim}"
+                if vae_decoder.condition_on_state
+                else ""
+            )
+            print(
+                f"Wrote {vae_out} (trained on actions, residual = decoder(z)*std, no mean{cond_note})"
+            )
+        env = ChunkResidualVecEnvWrapper(
+            vec_env=train_vec,
+            base_policy=base_policy,
+            action_scaler=action_scaler,
+            state_standardizer=state_standardizer,
+            act_chunk_size=act_chunk_size,
+            horizon=residual_horizon,
+            pca_basis=pca_basis if use_pca else None,
+            vae_decoder=vae_decoder if use_vae else None,
+        )
+        wrap_kwargs = dict(
+            pca_basis=pca_basis if use_pca else None,
+            vae_decoder=vae_decoder if use_vae else None,
+            act_chunk_size=act_chunk_size,
+            residual_horizon=residual_horizon,
+        )
+        if use_vae:
+            residual_kind = f"{'VAE' if vae_decoder.vae else 'AE'} k={chunk_cfg.k}"
+        elif use_pca:
+            residual_kind = f"PCA k={chunk_cfg.k}"
+        else:
+            residual_kind = f"full residual dim={env.rl_action_dim}"
+        print(f"Chunk residual wrapper: {residual_kind}, horizon={residual_horizon}, act_chunk={act_chunk_size}")
+    else:
+        env = get_envs(
+            env_name=cfg.task,
+            num_envs=cfg.num_envs,
+            base_policy=base_policy,
+            device=device_str,
+            video_key=cfg.video_key,
+            debug=cfg.debug,
+            action_scaler=action_scaler,
+            state_standardizer=state_standardizer,
+        )
+
     cfg.eval_num_envs = min(cfg.eval_num_envs, cfg.eval_num_episodes)
     num_cpus_available = os.cpu_count() - 1 if os.cpu_count() is not None else 1
     cfg.eval_num_envs = min(num_cpus_available, cfg.eval_num_envs)
+    if chunk_enabled:
+        cfg.eval_num_envs = 1
 
     eval_env = get_envs(
         env_name=cfg.task,
@@ -387,6 +549,7 @@ def main(cfg: ResidualTD3DexmgConfig):
         debug=cfg.debug,
         action_scaler=action_scaler,
         state_standardizer=state_standardizer,
+        **wrap_kwargs,
     )
 
     # Seed environments explicitly for reproducibility
@@ -408,9 +571,19 @@ def main(cfg: ResidualTD3DexmgConfig):
     assert isinstance(image_keys, list)
     lowdim_dim = env.observation_space["observation.state"].shape[1]
     img_c, img_h, img_w = env.observation_space[image_keys[0]].shape[1:]
-    action_dim = env.action_space.shape[1]
+    action_dim = env.action_space.shape[-1]
+    base_action_dim = int(getattr(env, "base_action_dim", action_dim))
+    critic_on_residual = bool(getattr(cfg.algo, "critic_on_residual", False))
+    if critic_on_residual and (use_pca or use_vae) and cfg.algo.offline_fraction > 0.0:
+        raise ValueError(
+            "critic_on_residual + PCA/VAE cannot use offline demos (residuals are not in latent coords)"
+        )
 
+    if use_vae and vae_decoder is not None:
+        vae_condition_on_state = bool(vae_decoder.condition_on_state)
     lowdim_keys = ["observation.state", "observation.base_action"]
+    if use_vae and vae_condition_on_state:
+        lowdim_keys.append("observation.vae_state")
 
     # ---------------------------------------------------------------------
     # Networks ------------------------------------------------------------
@@ -421,8 +594,30 @@ def main(cfg: ResidualTD3DexmgConfig):
         action_dim=action_dim,
         rl_cameras=image_keys,
         cfg=cfg.agent,
-        residual_actor=True,  # Enable residual actor mode
+        residual_actor=True,
+        combine_residual_with_base=True,
+        critic_on_residual=critic_on_residual,
+        base_action_dim=base_action_dim,
+        pca_basis=pca_basis if use_pca else None,
+        pca_reg_basis=pca_basis if pca_subspace_reg_weight > 0.0 else None,
+        pca_subspace_reg_weight=pca_subspace_reg_weight,
+        vae_decoder=vae_decoder if use_vae else None,
     )
+    critic_action_dim = action_dim if critic_on_residual else base_action_dim
+    if use_vae:
+        action_kind = "VAE coords"
+    elif use_pca:
+        action_kind = "PCA coords"
+    else:
+        action_kind = "window residual" if chunk_enabled else "residual"
+    critic_space = "actor residual" if critic_on_residual else "executed clip(base+delta)"
+    print(
+        f"QAgent: actor_dim={action_dim} ({action_kind}), "
+        f"critic_action_dim={critic_action_dim} ({critic_space}), "
+        f"horizon={residual_horizon if chunk_enabled else 1}, "
+        f"actor_squash={getattr(cfg.agent.actor, 'squash', 'tanh')}"
+    )
+
     horizon = env.vec_env.metadata["horizon"]
 
     # Set up actor learning rate warmup
@@ -446,11 +641,15 @@ def main(cfg: ResidualTD3DexmgConfig):
     if cfg.algo.offline_fraction == 0.0:
         print("Online-only training mode: offline_fraction=0.0")
 
+    rb_gamma = (cfg.algo.gamma**residual_horizon) if chunk_enabled else cfg.algo.gamma
+    if chunk_enabled:
+        print(f"Replay gamma = env_gamma**horizon = {cfg.algo.gamma}^{residual_horizon} = {rb_gamma:.6f}")
+
     online_rb = _make_replay_buffer(
         max_size=cfg.algo.buffer_size,
         batch_size=online_batch_size,
         n_step=cfg.algo.n_step,
-        gamma=cfg.algo.gamma,
+        gamma=rb_gamma,
         prefetch=cfg.algo.prefetch_batches,
         use_per=use_per,
         alpha=alpha,
@@ -468,12 +667,27 @@ def main(cfg: ResidualTD3DexmgConfig):
         "task": cfg.task,
         "image_keys": image_keys,
         "n_step": cfg.algo.n_step,
-        "gamma": cfg.algo.gamma,
+        "gamma": rb_gamma,
         "horizon": horizon,
         "size": cfg.algo.learning_starts,
         "sampling_strategy": cfg.algo.sampling_strategy,
         "buffer_size": cfg.algo.buffer_size,
         "batch_size": online_batch_size,
+        "chunk_residual": chunk_enabled,
+        "chunk_use_pca": use_pca,
+        "chunk_use_vae": use_vae,
+        "chunk_k": int(chunk_cfg.k) if (use_pca or use_vae) else None,
+        "chunk_vae": bool(getattr(chunk_cfg, "vae", True)) if use_vae else False,
+        "chunk_vae_beta": float(getattr(chunk_cfg, "vae_beta", 0.0)) if use_vae else None,
+        "chunk_vae_epochs": int(getattr(chunk_cfg, "vae_epochs", 0)) if use_vae else None,
+        "chunk_vae_condition_on_state": vae_condition_on_state if use_vae else False,
+        "chunk_horizon": residual_horizon if chunk_enabled else None,
+        "actor_squash": str(getattr(cfg.agent.actor, "squash", "tanh")),
+        "critic_on_residual": critic_on_residual,
+        "replay_stores_executed": not critic_on_residual,
+        "action_dim": int(action_dim if critic_on_residual else base_action_dim),
+        "actor_action_dim": int(action_dim),
+        "base_action_dim": int(base_action_dim),
         # Include random action noise scale to prevent mixing data from different noise levels
         "random_action_noise_scale": cfg.algo.random_action_noise_scale,
         # Normalization parameters for consistency
@@ -549,7 +763,7 @@ def main(cfg: ResidualTD3DexmgConfig):
         max_size=max_offline_transitions,
         batch_size=max(offline_batch_size, 1),
         n_step=cfg.algo.n_step,
-        gamma=cfg.algo.gamma,
+        gamma=rb_gamma,
         prefetch=cfg.algo.prefetch_batches,
         use_per=use_per,
         alpha=alpha,
@@ -626,10 +840,15 @@ def main(cfg: ResidualTD3DexmgConfig):
                 base_action_scaled = gt_action_scaled
 
             # Build observation dict directly in target format
+            curr_state = state_standardizer.standardize(sample["observation.state"].float().squeeze(0))
             curr_obs = {
-                "observation.state": state_standardizer.standardize(sample["observation.state"].float().squeeze(0)),
+                "observation.state": curr_state,
                 "observation.base_action": base_action_scaled,
             }
+            if use_vae and vae_condition_on_state:
+                # Demo frames have no ACT query. Use this frame's proprio so the
+                # replay schema matches online transitions.
+                curr_obs["observation.vae_state"] = curr_state
             for k in image_keys:
                 curr_obs[k] = sample[k].squeeze(0)
 
@@ -668,10 +887,11 @@ def main(cfg: ResidualTD3DexmgConfig):
             else:
                 step_id = 0
 
+            stored_action = gt_action_scaled - base_action_scaled if critic_on_residual else gt_action_scaled
             # Cache current frame for pairing with the next one ---------------
             episode_cache[ep_idx] = {
                 "obs": curr_obs,
-                "action": gt_action_scaled,
+                "action": stored_action,
                 "done": done_flag,
                 "step_id": step_id,
             }
@@ -698,6 +918,8 @@ def main(cfg: ResidualTD3DexmgConfig):
         "base_policy_wandb_id": cfg.base_policy.wandb_id,
         "sampling_strategy": cfg.algo.sampling_strategy,
         "normalized_actions": True,
+        "critic_on_residual": critic_on_residual,
+        "chunk_vae_condition_on_state": vae_condition_on_state if use_vae else False,
         "batch_size": offline_batch_size,
         # Library versions for compatibility
         "torchrl_version": torchrl.__version__,
@@ -766,8 +988,16 @@ def main(cfg: ResidualTD3DexmgConfig):
     # Warm-up phase (random policy) --------------------------------------
     # ------------------------------------------------------------------
 
-    if len(online_rb) < cfg.algo.learning_starts and not loaded_online_from_cache:
-        print(f"Warm-up: filling online buffer with {cfg.algo.learning_starts - len(online_rb)} random steps…")
+    warmup_transitions = cfg.algo.learning_starts
+    if chunk_enabled:
+        warmup_transitions = max(1, cfg.algo.learning_starts // residual_horizon)
+        print(
+            f"Chunk residual warmup: {warmup_transitions} window transitions "
+            f"(learning_starts={cfg.algo.learning_starts} env steps / horizon={residual_horizon})"
+        )
+
+    if len(online_rb) < warmup_transitions and not loaded_online_from_cache:
+        print(f"Warm-up: filling online buffer with {warmup_transitions - len(online_rb)} random steps…")
         obs, _ = env.reset()
         # --------------------------------------------------------------
         # Logging helper: print progress every 1 000 collected transitions
@@ -777,11 +1007,9 @@ def main(cfg: ResidualTD3DexmgConfig):
         reward_sum = 0
         episode_count = 0
 
-        while len(online_rb) < cfg.algo.learning_starts:
-            if cfg.algo.use_base_policy_for_warmup:
-                # Use base policy action + noise (residual exploration)
-                # Since the environment wrapper always adds base_action to residual_action,
-                # we just need to provide the noise as the residual action
+        while len(online_rb) < warmup_transitions:
+            if chunk_enabled or cfg.algo.use_base_policy_for_warmup:
+                # Residual-space noise (full chunk or PCA coords).
                 rand_actions = (
                     torch.rand((cfg.num_envs, action_dim), device=device) * 2 - 1
                 ) * cfg.algo.random_action_noise_scale
@@ -801,12 +1029,11 @@ def main(cfg: ResidualTD3DexmgConfig):
             reward_sum += reward.sum().item()
             episode_count += done.float().sum().item()
 
-            # Use the executed combined action returned by the environment
-            combined_action = info["scaled_action"]
+            rb_action = rand_actions if critic_on_residual else info["scaled_action"]
             _add_transitions_to_buffer(
                 obs=obs,
                 next_obs=next_obs,
-                actions=combined_action,
+                actions=rb_action,
                 reward=reward,
                 done=done,
                 info=info,
@@ -823,7 +1050,7 @@ def main(cfg: ResidualTD3DexmgConfig):
             if len(online_rb) >= next_log_threshold:
                 success_rate = reward_sum / episode_count if episode_count > 0 else 0.0
                 print(
-                    f"[Warm-up] {len(online_rb)} / {cfg.algo.learning_starts} "
+                    f"[Warm-up] {len(online_rb)} / {warmup_transitions} "
                     f"transitions collected, reward_sum={reward_sum:.2f}, "
                     f"success_rate={success_rate:.3f} ({reward_sum}/{episode_count})"
                 )
@@ -861,6 +1088,8 @@ def main(cfg: ResidualTD3DexmgConfig):
     # Additional flags ---------------------------------------------------------
     if cfg.agent.clip_q_target_to_reward_range:
         _hp_parts.append("clipT")
+    if critic_on_residual:
+        _hp_parts.append("qres")
 
     hp_str = "_".join(_hp_parts)
 
@@ -909,6 +1138,8 @@ def main(cfg: ResidualTD3DexmgConfig):
     best_eval_success_rate = 0.0
     training_cum_time = 0.0
     episode_count = 0
+    eval_interval = int(cfg.eval_interval_every_steps)
+    next_eval_step = 0 if cfg.eval_first else eval_interval
 
     train_start_time = time.time()
 
@@ -1003,6 +1234,7 @@ def main(cfg: ResidualTD3DexmgConfig):
 
             next_obs, reward, terminated, truncated, info = env.step(action)
             done = terminated | truncated
+        episode_log = None
         if done.any():
             episode_count += done.float().sum().item()
             # Extract episode information from final_info
@@ -1014,23 +1246,18 @@ def main(cfg: ResidualTD3DexmgConfig):
             discount_factor = cfg.algo.gamma ** episode_steps[episode_indices]
             episode_rewards = reward.cpu().numpy()[episode_indices]
             episode_return = np.mean(discount_factor * episode_rewards)
-
-            wandb.log(
-                {
-                    "training/episode_return": episode_return,
-                    "training/episode_steps": episode_steps,
-                    "training/episode_count": episode_count,
-                },
-                step=global_step,
-            )
+            episode_log = {
+                "training/episode_return": episode_return,
+                "training/episode_steps": episode_steps,
+                "training/episode_count": episode_count,
+            }
 
         # Add to online replay buffer --------------------------------------
-        # Use the executed combined action returned by the environment
-        combined_action = info["scaled_action"]
+        rb_action = action if critic_on_residual else info["scaled_action"]
         _add_transitions_to_buffer(
             obs=obs,
             next_obs=next_obs,
-            actions=combined_action,
+            actions=rb_action,
             reward=reward,
             done=done,
             info=info,
@@ -1042,18 +1269,22 @@ def main(cfg: ResidualTD3DexmgConfig):
         )
 
         obs = next_obs  # roll
+        global_step += _info_env_steps(info, cfg.num_envs)
 
         # ------------------------------------------------------------------
         # (3) Periodic evaluation ------------------------------------------
+        # Log at the interval mark (10k, 20k, ...) so every run shares x-axis.
         # ------------------------------------------------------------------
-        if global_step % cfg.eval_interval_every_steps == 0 and (cfg.eval_first or global_step > 0):
+        if global_step >= next_eval_step:
+            eval_log_step = next_eval_step
+            print(f"Eval at wandb step {eval_log_step} (env step {global_step})")
             with training_timer.time("evaluation"):
                 eval_metrics = run_dexmg_evaluation(
                     env=eval_env,
                     agent=agent,
                     num_episodes=cfg.eval_num_episodes,
                     device=device,
-                    global_step=global_step,
+                    global_step=eval_log_step,
                     save_video=cfg.save_video,
                     save_q_plots=cfg.save_video,  # Enable Q-plots when video saving is enabled
                     run_name=run_name,
@@ -1062,11 +1293,15 @@ def main(cfg: ResidualTD3DexmgConfig):
 
                 # Handle model saving when success rate improves
                 current_success_rate = eval_metrics["eval/success_rate"]
+                print(f"Eval success rate {current_success_rate:.4f} at step {eval_log_step}")
                 if current_success_rate > best_eval_success_rate:
                     print(f"🎉 New best success rate: {current_success_rate:.4f} (prev: {best_eval_success_rate:.4f})")
                     best_eval_success_rate = current_success_rate
+            while next_eval_step <= global_step:
+                next_eval_step += eval_interval
 
-        global_step += cfg.num_envs
+        if episode_log is not None:
+            wandb.log(episode_log, step=global_step)
 
         # ------------------------------------------------------------------
         # (4) Updates -------------------------------------------------------
@@ -1156,7 +1391,6 @@ def main(cfg: ResidualTD3DexmgConfig):
                 "timing/aggregate_steps_per_second": global_step / (time.time() - train_start_time),
                 "training/actor_lr": agent.actor_opt.param_groups[0]["lr"],
             }
-
             # Add timing statistics
             timing_stats = training_timer.get_timing_stats()
             log_dict.update(timing_stats)
@@ -1215,6 +1449,8 @@ def main(cfg: ResidualTD3DexmgConfig):
             # Add L2 penalty if active
             if "train/actor_l2_penalty" in metrics:
                 print_msg += f" l2_penalty={metrics['train/actor_l2_penalty']:.4f}"
+            if "train/pca_subspace_penalty" in metrics:
+                print_msg += f" pca_subspace_penalty={metrics['train/pca_subspace_penalty']:.4f}"
 
             # Add timing percentages to print statement
             if timing_stats:
