@@ -40,6 +40,8 @@ class BasePolicyVecEnvWrapper:
         base_policy: ACTPolicy,
         action_scaler,
         state_standardizer,
+        action_chunk: int = 1,
+        requery: bool = False,
     ):
         """
         Args:
@@ -47,6 +49,8 @@ class BasePolicyVecEnvWrapper:
             base_policy: Base policy (e.g., ACTPolicy) to augment with residual actions
             action_scaler: ActionScaler object for scaling/unscaling actions (REQUIRED)
             state_standardizer: StateStandardizer object for standardizing states (REQUIRED)
+            action_chunk: RL action chunk size. 
+            requery: False walks one ACT prediction. True queries again after every window.
         """
         assert action_scaler is not None, "action_scaler is required for consistent normalization"
         assert state_standardizer is not None, "state_standardizer is required for consistent normalization"
@@ -55,15 +59,27 @@ class BasePolicyVecEnvWrapper:
         self.base_policy = base_policy
         self.action_scaler = action_scaler
         self.state_standardizer = state_standardizer
+        self.action_chunk = int(action_chunk)
+        self.requery = bool(requery)
+        self.n_action_steps = int(getattr(base_policy.config, "n_action_steps", 1))
 
         # Get action dimension from the environment
         self.action_dim = vec_env.action_space.shape[-1]
+        self.rl_action_dim = self.action_dim * self.action_chunk
 
         # Store image keys from base policy config
         self.image_keys = list(base_policy.config.image_features.keys())
 
         # Create modified observation space that includes base actions
         self._setup_observation_space()
+        if self.action_chunk > 1:
+            batch_shape = vec_env.action_space.shape[:-1]
+            self.action_space = gym.spaces.Box(
+                low=-1.0,
+                high=1.0,
+                shape=(*batch_shape, self.rl_action_dim),
+                dtype=np.float32,
+            )
 
     def _setup_observation_space(self):
         """Setup observation space to include base actions in the state."""
@@ -96,12 +112,7 @@ class BasePolicyVecEnvWrapper:
 
         # Reset base policy
         self.base_policy.reset()
-
-        # Get base action from the base policy
-        with torch.no_grad():
-            base_action = self.base_policy.select_action(raw_obs)
-
-        base_naction = self.action_scaler.scale(base_action)
+        base_naction = self._refresh_chunk(raw_obs)
 
         # Augment observations with base action and apply state standardization
         augmented_obs = self._augment_obs(raw_obs, base_naction)
@@ -112,7 +123,7 @@ class BasePolicyVecEnvWrapper:
         return augmented_obs, info
 
     def step(
-        self, residual_naction: torch.Tensor
+        self, residual_naction: torch.Tensor, on_env_step=None
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor, dict]:
         """
         Step the environment with residual action.
@@ -133,39 +144,56 @@ class BasePolicyVecEnvWrapper:
         # we use the normalized actions as the action space
         # The normalized base action is stored as [-1, 1] in the replay buffer
         # and the residual action is predicted as action_scale * [-1, 1]
-        combined_naction = self._last_base_naction + residual_naction
+        base = self._last_base_naction.view(residual_naction.shape[0], self.action_chunk, self.action_dim)
+        delta = residual_naction.view_as(base)
+        combined = torch.clamp(base + delta, -1.0, 1.0)
 
-        # Unscale back to original action space for environment execution
-        env_action = self.action_scaler.unscale(combined_naction)
+        success = torch.zeros(combined.shape[0], device=combined.device, dtype=torch.bool)
+        raw_obs = None
+        reward = None
+        terminated = truncated = None
+        last_info: dict = {}
+        n_inner = 0
+        for i in range(self.action_chunk):
+            # Unscale back to original action space for environment execution
+            env_action = self.action_scaler.unscale(combined[:, i])
+            # Step the underlying vectorized environment
+            raw_obs, reward, terminated, truncated, last_info = self.vec_env.step(
+                env_action
+            )
+            success = success | (reward.reshape(reward.shape[0], -1) == 1.0).any(dim=-1)
+            n_inner += 1
+            if on_env_step is not None:
+                on_env_step()
+            if (terminated | truncated).any():
+                break
 
-        # Step the underlying vectorized environment
-        raw_obs, reward, terminated, truncated, info = self.vec_env.step(env_action)
-
+        last_info = dict(last_info)
         # Store the scaled action for replay buffer (already computed above)
-        info["scaled_action"] = combined_naction
+        last_info["scaled_action"] = combined.reshape(combined.shape[0], -1).detach()
+        last_info["chunk_env_steps"] = int(n_inner)
 
-        # Get next base action from the base policy
-        with torch.no_grad():
-            base_action = self.base_policy.select_action(raw_obs)
-
-        base_naction = self.action_scaler.scale(base_action)
-
-        # Handle policy reset for terminated environments
-        if terminated.any():
-            reset_ids = torch.where(terminated)[0]
-            self.base_policy.reset(env_ids=reset_ids)
-
-        # Augment observations with base action and apply state standardization
-        augmented_obs = self._augment_obs(raw_obs, base_naction)
-
-        # Handle final_obs in info dict to ensure consistent shapes
-        if "final_obs" in info:
-            info = self._process_final_obs_in_info(info, combined_naction.device)
-
+        done_mask = terminated | truncated
+        if done_mask.any():
+            # Handle policy reset for terminated environments
+            self.base_policy.reset(env_ids=torch.where(done_mask)[0].tolist())
+            # Get next base action from the base policy
+            base_naction = self._refresh_chunk(raw_obs)
+        elif self.requery or self._t + self.action_chunk >= self.n_action_steps:
+            base_naction = self._refresh_chunk(raw_obs)
+        else:
+            self._t += self.action_chunk
+            base_naction = self._window_flat()
         # Store for next step
         self._last_base_naction = base_naction
 
-        return augmented_obs, reward, terminated, truncated, info
+        # Handle final_obs in info dict to ensure consistent shapes
+        if "final_obs" in last_info:
+            last_info = self._process_final_obs_in_info(last_info, combined.device)
+
+        reward_out = success.to(dtype=reward.dtype)
+        # Augment observations with base action and apply state standardization
+        return self._augment_obs(raw_obs, base_naction), reward_out, terminated, truncated, last_info
 
     def _augment_obs(self, raw_obs: dict[str, torch.Tensor], base_naction: torch.Tensor) -> dict[str, torch.Tensor]:
         """Augment observations with base actions."""
@@ -186,10 +214,22 @@ class BasePolicyVecEnvWrapper:
             if final_obs_dict is not None and "observation.state" in final_obs_dict:
                 # Pad with zeros (no action taken at terminal state)
                 final_obs_dict["observation.base_action"] = torch.zeros(
-                    self.action_dim, device=device, dtype=torch.float32
+                    self.rl_action_dim, device=device, dtype=torch.float32
                 )
 
         return info
+
+    def _refresh_chunk(self, raw_obs: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Query ACT and return the first action_chunk scaled actions, flattened."""
+        with torch.no_grad():
+            chunk = self.base_policy.predict_action_chunk(raw_obs)
+        self._chunk = self.action_scaler.scale(chunk)
+        self._t = 0
+        return self._window_flat()
+
+    def _window_flat(self) -> torch.Tensor:
+        window = self._chunk[:, self._t : self._t + self.action_chunk]
+        return window.reshape(window.shape[0], -1)
 
     def render(self):
         """Pass through to underlying environment."""

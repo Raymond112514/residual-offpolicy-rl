@@ -73,6 +73,11 @@ class ResidualTD3AlgoConfig(RLPDAlgoConfig):
     # I.e., starts clipping linearly from 0 to action scale over progressive_clipping_steps steps
     progressive_clipping_steps: int = 0
 
+    # If requery=False, we generate one ACT action chunk (20 actions) and take subchunks from it. We dont requery until all actions have been used
+    # If requery=True, we generate one ACT action chunk and keep only the first action_chunk actions. We requery after every window.
+    action_chunk: int = 1
+    requery: bool = False
+    warmup_episode: int = 30
 
 # -----------------------------------------------------------------------------
 # Top-level experiment config --------------------------------------------------

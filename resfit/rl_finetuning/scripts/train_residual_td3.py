@@ -319,6 +319,8 @@ def main(cfg: ResidualTD3DexmgConfig):
         debug: bool,
         action_scaler: ActionScaler,
         state_standardizer: StateStandardizer,
+        action_chunk: int,
+        requery: bool,
     ):
         assert action_scaler is not None, "action_scaler must be provided for consistent normalization"
         assert state_standardizer is not None, "state_standardizer must be provided for consistent normalization"
@@ -338,6 +340,8 @@ def main(cfg: ResidualTD3DexmgConfig):
             base_policy=base_policy,
             action_scaler=action_scaler,
             state_standardizer=state_standardizer,
+            action_chunk=action_chunk,
+            requery=requery,
         )
 
     # ---------------------------------------------------------------------
@@ -361,6 +365,28 @@ def main(cfg: ResidualTD3DexmgConfig):
     print(f"Set random seed to {cfg.seed}")
 
     # ---------------------------------------------------------------------
+    # Action chunk ---------------------------------------------------------
+    # ---------------------------------------------------------------------
+    action_chunk = int(cfg.algo.action_chunk)
+    requery = bool(cfg.algo.requery)
+    n_action_steps = int(getattr(base_policy.config, "n_action_steps", 1))
+    assert action_chunk > 0 and n_action_steps % action_chunk == 0, (
+        f"action_chunk={action_chunk} must be a positive divisor of n_action_steps={n_action_steps}"
+    )
+    if action_chunk > 1:
+        if cfg.algo.n_step != 1:
+            print(f"action_chunk: forcing n_step=1 (was {cfg.algo.n_step})")
+            with open_dict(cfg.algo):
+                cfg.algo.n_step = 1
+        if cfg.algo.offline_fraction > 0.0:
+            print("action_chunk: forcing offline_fraction=0.0 (demos are single-step)")
+            with open_dict(cfg.algo):
+                cfg.algo.offline_fraction = 0.0
+        if cfg.eval_num_envs != 1:
+            print("action_chunk: forcing eval_num_envs=1")
+            cfg.eval_num_envs = 1
+
+    # ---------------------------------------------------------------------
     # Environment setup ----------------------------------------------------
     # ---------------------------------------------------------------------
     assert cfg.num_envs == 1, "Only support 1 environment for now because of how n_step is implemented"
@@ -373,6 +399,8 @@ def main(cfg: ResidualTD3DexmgConfig):
         debug=cfg.debug,
         action_scaler=action_scaler,
         state_standardizer=state_standardizer,
+        action_chunk=action_chunk,
+        requery=requery,
     )
     cfg.eval_num_envs = min(cfg.eval_num_envs, cfg.eval_num_episodes)
     num_cpus_available = os.cpu_count() - 1 if os.cpu_count() is not None else 1
@@ -387,6 +415,8 @@ def main(cfg: ResidualTD3DexmgConfig):
         debug=cfg.debug,
         action_scaler=action_scaler,
         state_standardizer=state_standardizer,
+        action_chunk=action_chunk,
+        requery=requery,
     )
 
     # Seed environments explicitly for reproducibility
@@ -446,11 +476,14 @@ def main(cfg: ResidualTD3DexmgConfig):
     if cfg.algo.offline_fraction == 0.0:
         print("Online-only training mode: offline_fraction=0.0")
 
+    # Per transition discount
+    rb_gamma = cfg.algo.gamma**action_chunk if action_chunk > 1 else cfg.algo.gamma
+
     online_rb = _make_replay_buffer(
         max_size=cfg.algo.buffer_size,
         batch_size=online_batch_size,
         n_step=cfg.algo.n_step,
-        gamma=cfg.algo.gamma,
+        gamma=rb_gamma,
         prefetch=cfg.algo.prefetch_batches,
         use_per=use_per,
         alpha=alpha,
@@ -470,7 +503,7 @@ def main(cfg: ResidualTD3DexmgConfig):
         "n_step": cfg.algo.n_step,
         "gamma": cfg.algo.gamma,
         "horizon": horizon,
-        "size": cfg.algo.learning_starts,
+        "warmup_episode": int(cfg.algo.warmup_episode),
         "sampling_strategy": cfg.algo.sampling_strategy,
         "buffer_size": cfg.algo.buffer_size,
         "batch_size": online_batch_size,
@@ -487,6 +520,10 @@ def main(cfg: ResidualTD3DexmgConfig):
     if cfg.algo.sampling_strategy == "prioritized_replay":
         online_cache_meta["priority_alpha"] = cfg.algo.priority_alpha
         online_cache_meta["priority_beta"] = cfg.algo.priority_beta
+    if action_chunk > 1 or requery:
+        online_cache_meta["action_chunk"] = action_chunk
+        online_cache_meta["requery"] = requery
+        online_cache_meta["replay_gamma"] = rb_gamma
 
     pprint.pprint(online_cache_meta)
     _online_meta_str = json.dumps(online_cache_meta, sort_keys=True)
@@ -549,7 +586,7 @@ def main(cfg: ResidualTD3DexmgConfig):
         max_size=max_offline_transitions,
         batch_size=max(offline_batch_size, 1),
         n_step=cfg.algo.n_step,
-        gamma=cfg.algo.gamma,
+        gamma=rb_gamma,
         prefetch=cfg.algo.prefetch_batches,
         use_per=use_per,
         alpha=alpha,
@@ -766,18 +803,17 @@ def main(cfg: ResidualTD3DexmgConfig):
     # Warm-up phase (random policy) --------------------------------------
     # ------------------------------------------------------------------
 
-    if len(online_rb) < cfg.algo.learning_starts and not loaded_online_from_cache:
-        print(f"Warm-up: filling online buffer with {cfg.algo.learning_starts - len(online_rb)} random steps…")
-        obs, _ = env.reset()
-        # --------------------------------------------------------------
-        # Logging helper: print progress every 1 000 collected transitions
-        # --------------------------------------------------------------
-        next_log_threshold = 1000  # first threshold for progress message
+    warmup_episodes = int(cfg.algo.warmup_episode)
+    assert warmup_episodes > 0, f"warmup_episode must be positive, got {warmup_episodes}"
 
-        reward_sum = 0
+    if not loaded_online_from_cache:
+        print(f"Warm-up: collecting {warmup_episodes} random episodes")
+        obs, _ = env.reset()
+
+        reward_sum = 0.0
         episode_count = 0
 
-        while len(online_rb) < cfg.algo.learning_starts:
+        while episode_count < warmup_episodes:
             if cfg.algo.use_base_policy_for_warmup:
                 # Use base policy action + noise (residual exploration)
                 # Since the environment wrapper always adds base_action to residual_action,
@@ -799,7 +835,7 @@ def main(cfg: ResidualTD3DexmgConfig):
             done = terminated | truncated
 
             reward_sum += reward.sum().item()
-            episode_count += done.float().sum().item()
+            episode_count += int(done.sum().item())
 
             # Use the executed combined action returned by the environment
             combined_action = info["scaled_action"]
@@ -817,17 +853,12 @@ def main(cfg: ResidualTD3DexmgConfig):
                 online_rb=online_rb,
             )
 
-            # ----------------------------------------------------------
-            # Progress logging (every ~1 000 transitions) --------------
-            # ----------------------------------------------------------
-            if len(online_rb) >= next_log_threshold:
+            if done.any():
                 success_rate = reward_sum / episode_count if episode_count > 0 else 0.0
                 print(
-                    f"[Warm-up] {len(online_rb)} / {cfg.algo.learning_starts} "
-                    f"transitions collected, reward_sum={reward_sum:.2f}, "
-                    f"success_rate={success_rate:.3f} ({reward_sum}/{episode_count})"
+                    f"[Warm-up] {episode_count} / {warmup_episodes} episodes, "
+                    f"transitions={len(online_rb)}, success_rate={success_rate:.3f}"
                 )
-                next_log_threshold += 1000
 
             obs = next_obs  # roll state
 
@@ -987,6 +1018,36 @@ def main(cfg: ResidualTD3DexmgConfig):
         )
         print("Critic warmup completed.")
 
+    interval = cfg.eval_interval_every_steps
+
+    def _evaluate():
+        nonlocal best_eval_success_rate
+        with training_timer.time("evaluation"):
+            eval_metrics = run_dexmg_evaluation(
+                env=eval_env,
+                agent=agent,
+                num_episodes=cfg.eval_num_episodes,
+                device=device,
+                global_step=global_step,
+                save_video=cfg.save_video,
+                save_q_plots=cfg.save_video,
+                run_name=run_name,
+                output_dir=outputs_dir,
+            )
+            current_success_rate = eval_metrics["eval/success_rate"]
+            if current_success_rate > best_eval_success_rate:
+                print(f"🎉 New best success rate: {current_success_rate:.4f} (prev: {best_eval_success_rate:.4f})")
+                best_eval_success_rate = current_success_rate
+
+    def _after_env_step():
+        nonlocal global_step
+        global_step += 1
+        if interval > 0 and global_step % interval == 0:
+            _evaluate()
+
+    if cfg.eval_first:
+        _evaluate()
+
     while global_step <= cfg.algo.total_timesteps:
         iter_start = time.time()
         # ------------------------------------------------------------------
@@ -1001,7 +1062,7 @@ def main(cfg: ResidualTD3DexmgConfig):
                 clip_factor = min(1.0, global_step / cfg.algo.progressive_clipping_steps)
                 action = action * clip_factor
 
-            next_obs, reward, terminated, truncated, info = env.step(action)
+            next_obs, reward, terminated, truncated, info = env.step(action, on_env_step=_after_env_step)
             done = terminated | truncated
         if done.any():
             episode_count += done.float().sum().item()
@@ -1042,31 +1103,6 @@ def main(cfg: ResidualTD3DexmgConfig):
         )
 
         obs = next_obs  # roll
-
-        # ------------------------------------------------------------------
-        # (3) Periodic evaluation ------------------------------------------
-        # ------------------------------------------------------------------
-        if global_step % cfg.eval_interval_every_steps == 0 and (cfg.eval_first or global_step > 0):
-            with training_timer.time("evaluation"):
-                eval_metrics = run_dexmg_evaluation(
-                    env=eval_env,
-                    agent=agent,
-                    num_episodes=cfg.eval_num_episodes,
-                    device=device,
-                    global_step=global_step,
-                    save_video=cfg.save_video,
-                    save_q_plots=cfg.save_video,  # Enable Q-plots when video saving is enabled
-                    run_name=run_name,
-                    output_dir=outputs_dir,
-                )
-
-                # Handle model saving when success rate improves
-                current_success_rate = eval_metrics["eval/success_rate"]
-                if current_success_rate > best_eval_success_rate:
-                    print(f"🎉 New best success rate: {current_success_rate:.4f} (prev: {best_eval_success_rate:.4f})")
-                    best_eval_success_rate = current_success_rate
-
-        global_step += cfg.num_envs
 
         # ------------------------------------------------------------------
         # (4) Updates -------------------------------------------------------
