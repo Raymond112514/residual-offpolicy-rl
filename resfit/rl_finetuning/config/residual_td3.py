@@ -77,6 +77,8 @@ class ResidualTD3AlgoConfig(RLPDAlgoConfig):
     # If requery=True, we generate one ACT action chunk and keep only the first action_chunk actions. We requery after every window.
     action_chunk: int = 1
     requery: bool = False
+    # Defines the reward used for action chunk. If True, the reward is the discounted sum of the per step rewards. If False, the reward is 1 if any step in the chunk succeeds, else 0.
+    action_chunk_reward_discount: bool = True
     warmup_episode: int = 30
 
 # -----------------------------------------------------------------------------

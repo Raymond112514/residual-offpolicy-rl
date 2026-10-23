@@ -42,6 +42,8 @@ class BasePolicyVecEnvWrapper:
         state_standardizer,
         action_chunk: int = 1,
         requery: bool = False,
+        gamma: float = 0.99,
+        reward_discount: bool = True,
     ):
         """
         Args:
@@ -51,6 +53,8 @@ class BasePolicyVecEnvWrapper:
             state_standardizer: StateStandardizer object for standardizing states (REQUIRED)
             action_chunk: RL action chunk size. 
             requery: False walks one ACT prediction. True queries again after every window.
+            gamma: Per-environment-step discount used inside a chunk.
+            reward_discount: If True, store sum_i gamma^i r_{t+i}. If False, store 0/1 success.
         """
         assert action_scaler is not None, "action_scaler is required for consistent normalization"
         assert state_standardizer is not None, "state_standardizer is required for consistent normalization"
@@ -61,6 +65,8 @@ class BasePolicyVecEnvWrapper:
         self.state_standardizer = state_standardizer
         self.action_chunk = int(action_chunk)
         self.requery = bool(requery)
+        self.gamma = float(gamma)
+        self.reward_discount = bool(reward_discount)
         self.n_action_steps = int(getattr(base_policy.config, "n_action_steps", 1))
 
         # Get action dimension from the environment
@@ -148,7 +154,8 @@ class BasePolicyVecEnvWrapper:
         delta = residual_naction.view_as(base)
         combined = torch.clamp(base + delta, -1.0, 1.0)
 
-        success = torch.zeros(combined.shape[0], device=combined.device, dtype=torch.bool)
+        discounted_reward = torch.zeros(combined.shape[0], device=combined.device, dtype=torch.float32)
+        step_discount = 1.0
         raw_obs = None
         reward = None
         terminated = truncated = None
@@ -161,7 +168,14 @@ class BasePolicyVecEnvWrapper:
             raw_obs, reward, terminated, truncated, last_info = self.vec_env.step(
                 env_action
             )
-            success = success | (reward.reshape(reward.shape[0], -1) == 1.0).any(dim=-1)
+            r = reward.reshape(reward.shape[0], -1)
+            if self.reward_discount:
+                discounted_reward = discounted_reward + r.sum(dim=-1) * step_discount
+                step_discount *= self.gamma
+            else:
+                discounted_reward = torch.maximum(
+                    discounted_reward, (r == 1.0).any(dim=-1).to(dtype=discounted_reward.dtype)
+                )
             n_inner += 1
             if on_env_step is not None:
                 on_env_step()
@@ -191,7 +205,7 @@ class BasePolicyVecEnvWrapper:
         if "final_obs" in last_info:
             last_info = self._process_final_obs_in_info(last_info, combined.device)
 
-        reward_out = success.to(dtype=reward.dtype)
+        reward_out = discounted_reward.to(dtype=reward.dtype)
         # Augment observations with base action and apply state standardization
         return self._augment_obs(raw_obs, base_naction), reward_out, terminated, truncated, last_info
 

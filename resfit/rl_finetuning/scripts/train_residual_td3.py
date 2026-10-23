@@ -321,6 +321,8 @@ def main(cfg: ResidualTD3DexmgConfig):
         state_standardizer: StateStandardizer,
         action_chunk: int,
         requery: bool,
+        gamma: float,
+        reward_discount: bool,
     ):
         assert action_scaler is not None, "action_scaler must be provided for consistent normalization"
         assert state_standardizer is not None, "state_standardizer must be provided for consistent normalization"
@@ -342,6 +344,8 @@ def main(cfg: ResidualTD3DexmgConfig):
             state_standardizer=state_standardizer,
             action_chunk=action_chunk,
             requery=requery,
+            gamma=gamma,
+            reward_discount=reward_discount,
         )
 
     # ---------------------------------------------------------------------
@@ -401,6 +405,8 @@ def main(cfg: ResidualTD3DexmgConfig):
         state_standardizer=state_standardizer,
         action_chunk=action_chunk,
         requery=requery,
+        gamma=cfg.algo.gamma,
+        reward_discount=bool(cfg.algo.action_chunk_reward_discount),
     )
     cfg.eval_num_envs = min(cfg.eval_num_envs, cfg.eval_num_episodes)
     num_cpus_available = os.cpu_count() - 1 if os.cpu_count() is not None else 1
@@ -417,6 +423,8 @@ def main(cfg: ResidualTD3DexmgConfig):
         state_standardizer=state_standardizer,
         action_chunk=action_chunk,
         requery=requery,
+        gamma=cfg.algo.gamma,
+        reward_discount=bool(cfg.algo.action_chunk_reward_discount),
     )
 
     # Seed environments explicitly for reproducibility
@@ -476,7 +484,6 @@ def main(cfg: ResidualTD3DexmgConfig):
     if cfg.algo.offline_fraction == 0.0:
         print("Online-only training mode: offline_fraction=0.0")
 
-    # Per transition discount
     rb_gamma = cfg.algo.gamma**action_chunk if action_chunk > 1 else cfg.algo.gamma
 
     online_rb = _make_replay_buffer(
@@ -857,7 +864,7 @@ def main(cfg: ResidualTD3DexmgConfig):
                 success_rate = reward_sum / episode_count if episode_count > 0 else 0.0
                 print(
                     f"[Warm-up] {episode_count} / {warmup_episodes} episodes, "
-                    f"transitions={len(online_rb)}, success_rate={success_rate:.3f}"
+                    f"transitions={len(online_rb)}, return={success_rate:.3f}"
                 )
 
             obs = next_obs  # roll state
