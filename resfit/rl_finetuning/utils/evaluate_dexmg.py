@@ -181,7 +181,9 @@ def run_dexmg_evaluation(
 
             # For Q-value computation, use combined action and clamp to [-1, 1] (consistent with training)
             if agent.residual_actor:
-                q_actions = torch.clamp(obs["observation.base_action"] + actions, -1.0, 1.0)
+                q_actions = agent.executed_action(
+                    actions, obs["observation.base_action"], obs.get("observation.state")
+                )
 
             q_pred = (
                 agent.critic.q_value(obs_q["feat"], obs_q["observation.state"], q_actions).detach().cpu().squeeze(-1)

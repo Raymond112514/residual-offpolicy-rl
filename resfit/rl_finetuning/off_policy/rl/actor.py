@@ -2,6 +2,8 @@
 
 # SPDX-License-Identifier: CC-BY-NC-4.0
 
+from __future__ import annotations
+
 import torch
 from torch import nn
 
@@ -66,16 +68,26 @@ class SpatialEmb(nn.Module):
 
 
 class Actor(nn.Module):
-    def __init__(self, repr_dim, patch_repr_dim, prop_dim, action_dim, cfg: ActorConfig, residual_actor: bool = False):
+    def __init__(
+        self,
+        repr_dim,
+        patch_repr_dim,
+        prop_dim,
+        action_dim,
+        cfg: ActorConfig,
+        residual_actor: bool = False,
+        base_action_dim: int | None = None,
+    ):
         super().__init__()
 
         self.prop_dim = prop_dim
         self.residual_actor = residual_actor
         self.cfg = cfg
+        self.base_action_dim = action_dim if base_action_dim is None else int(base_action_dim)
 
         if residual_actor:
             # The residual actor takes the base action as input alongside the state
-            self.prop_dim += action_dim
+            self.prop_dim += self.base_action_dim
 
         if cfg.spatial_emb > 0:
             assert cfg.spatial_emb > 1, "this is the dimension"
@@ -161,7 +173,8 @@ class Actor(nn.Module):
             all_input.append(prop)
             if self.residual_actor:
                 # The residual actor takes the base action as input alongside the state
-                all_input.append(obs["observation.base_action"])
+                base_action = obs["observation.base_action"]
+                all_input.append(base_action.reshape(base_action.shape[0], -1))
 
         policy_input = torch.cat(all_input, dim=-1)
 

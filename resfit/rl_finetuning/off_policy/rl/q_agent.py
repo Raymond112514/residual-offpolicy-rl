@@ -11,6 +11,7 @@ import torch
 from torch import nn
 
 from resfit.rl_finetuning.config.rlpd import QAgentConfig
+from resfit.rl_finetuning.latent_rl.base import LatentModel, decode_latent
 from resfit.rl_finetuning.off_policy import common_utils
 from resfit.rl_finetuning.off_policy.common_utils import utils
 from resfit.rl_finetuning.off_policy.networks.encoder import VitEncoder
@@ -27,6 +28,9 @@ class QAgent(nn.Module):
         rl_cameras: list[str] | str,
         cfg: QAgentConfig,
         residual_actor: bool = False,
+        actor_action_dim: int | None = None,
+        base_action_dim: int | None = None,
+        latent: LatentModel | None = None,
     ):
         """Initialize the Q-agent.
 
@@ -56,6 +60,13 @@ class QAgent(nn.Module):
         self.rl_cameras = rl_cameras
         self.cfg = cfg
         self.residual_actor = residual_actor
+        self.latent = latent
+        if self.latent is not None:
+            self.latent.eval()
+            for param in self.latent.parameters():
+                param.requires_grad_(False)
+        self.actor_action_dim = action_dim if actor_action_dim is None else int(actor_action_dim)
+        self.base_action_dim = action_dim if base_action_dim is None else int(base_action_dim)
 
         # Build the per-camera encoders *after* `self.rl_cameras` is defined so
         # that the helper function can iterate over them.
@@ -83,7 +94,15 @@ class QAgent(nn.Module):
             action_dim=action_dim,
             cfg=self.cfg.critic,
         )
-        self.actor = Actor(repr_dim, patch_repr_dim, prop_dim, action_dim, cfg.actor, residual_actor=residual_actor)
+        self.actor = Actor(
+            repr_dim,
+            patch_repr_dim,
+            prop_dim,
+            self.actor_action_dim,
+            cfg.actor,
+            residual_actor=residual_actor,
+            base_action_dim=self.base_action_dim,
+        )
 
         self.critic_target = copy.deepcopy(self.critic)
         self.actor_target = copy.deepcopy(self.actor)
@@ -182,6 +201,8 @@ class QAgent(nn.Module):
         self.encoders.train(training)
         self.actor.train(training)
         self.critic.train(training)
+        if self.latent is not None:
+            self.latent.eval()
 
         assert not self.critic_target.training
         for bc_policy in self.bc_policies:
@@ -299,6 +320,29 @@ class QAgent(nn.Module):
 
         return action
 
+    def executed_action(
+        self,
+        residual: torch.Tensor,
+        base_action: torch.Tensor,
+        state: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Executed chunk the critic is trained on: clip(base + decode(z)).
+
+        With no latent model, decode is the identity and this is clip(base + residual).
+        """
+        squeezed = residual.ndim == 1
+        if squeezed:
+            residual = residual.unsqueeze(0)
+            if base_action.ndim == 1:
+                base_action = base_action.unsqueeze(0)
+            if state is not None and state.ndim == 1:
+                state = state.unsqueeze(0)
+        delta = decode_latent(self.latent, residual, state)
+        if self.residual_actor:
+            base = base_action.reshape(residual.shape[0], -1)
+            delta = torch.clamp(base + delta, -1.0, 1.0)
+        return delta.squeeze(0) if squeezed else delta
+
     def update_critic(
         self,
         obs: dict[str, torch.Tensor],
@@ -324,9 +368,12 @@ class QAgent(nn.Module):
             )
 
             if self.residual_actor:
-                # Current step: 'action' from the replay buffer is the executed combined action
-                # Next step: combine and clamp to match environment execution
-                next_action = torch.clamp(next_obs["observation.base_action"] + next_residual_action, -1.0, 1.0)
+                # Replay stores the executed chunk. The target uses the same mapping as env.step.
+                next_action = self.executed_action(
+                    next_residual_action,
+                    next_obs["observation.base_action"],
+                    next_obs.get("observation.state"),
+                )
             else:
                 next_action = next_residual_action
 
@@ -438,9 +485,9 @@ class QAgent(nn.Module):
         action_l2_penalty = self.cfg.actor.action_l2_reg_weight * torch.mean(torch.sum(action_pred**2, dim=-1))
 
         if self.residual_actor:
-            # Create the full action by combining the base action and the residual action
-            # and clamp to the valid range [-1, 1] to match environment execution
-            combined_action = torch.clamp(obs["observation.base_action"] + action_pred, -1.0, 1.0)
+            combined_action = self.executed_action(
+                action_pred, obs["observation.base_action"], obs.get("observation.state")
+            )
         else:
             combined_action = action_pred
 

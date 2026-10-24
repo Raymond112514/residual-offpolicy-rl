@@ -12,12 +12,15 @@ This wrapper assumes:
 - The environment comes from create_vectorized_env
 """
 
+from __future__ import annotations
+
 import gymnasium as gym
 import numpy as np
 import torch
 
 from resfit.dexmg.environments.dexmg import VectorizedEnvWrapper
 from resfit.lerobot.policies.act.modeling_act import ACTPolicy
+from resfit.rl_finetuning.latent_rl.base import LatentModel, decode_latent
 
 
 class BasePolicyVecEnvWrapper:
@@ -68,6 +71,8 @@ class BasePolicyVecEnvWrapper:
         self.gamma = float(gamma)
         self.reward_discount = bool(reward_discount)
         self.n_action_steps = int(getattr(base_policy.config, "n_action_steps", 1))
+        self.latent: LatentModel | None = None
+        self._last_state: torch.Tensor | None = None
 
         # Get action dimension from the environment
         self.action_dim = vec_env.action_space.shape[-1]
@@ -150,8 +155,11 @@ class BasePolicyVecEnvWrapper:
         # we use the normalized actions as the action space
         # The normalized base action is stored as [-1, 1] in the replay buffer
         # and the residual action is predicted as action_scale * [-1, 1]
-        base = self._last_base_naction.view(residual_naction.shape[0], self.action_chunk, self.action_dim)
-        delta = residual_naction.view_as(base)
+        batch = residual_naction.shape[0]
+        base = self._last_base_naction.view(batch, self.action_chunk, self.action_dim)
+        with torch.no_grad():
+            delta = decode_latent(self.latent, residual_naction, self._last_state)
+        delta = delta.view(batch, self.action_chunk, self.action_dim)
         combined = torch.clamp(base + delta, -1.0, 1.0)
 
         discounted_reward = torch.zeros(combined.shape[0], device=combined.device, dtype=torch.float32)
@@ -216,8 +224,13 @@ class BasePolicyVecEnvWrapper:
         augmented_obs = raw_obs.copy()
         augmented_obs["observation.base_action"] = base_naction
         augmented_obs["observation.state"] = self.state_standardizer.standardize(augmented_obs["observation.state"])
+        self._last_state = augmented_obs["observation.state"]
 
         return augmented_obs
+
+    def set_latent(self, latent: LatentModel | None) -> None:
+        """Attach a fitted latent model. ``step`` decodes actor outputs before adding them to the base chunk."""
+        self.latent = latent
 
     def _process_final_obs_in_info(self, info: dict, device: torch.device) -> dict:
         """Pad final_obs state with zeros to match augmented observation format."""

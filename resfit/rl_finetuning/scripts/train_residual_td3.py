@@ -46,6 +46,7 @@ from resfit.lerobot.policies.act.configuration_act import ACTConfig
 from resfit.lerobot.policies.act.modeling_act import ACTPolicy
 from resfit.lerobot.utils.load_policy import download_policy_from_wandb, load_policy
 from resfit.rl_finetuning.config.residual_td3 import ResidualTD3DexmgConfig
+from resfit.rl_finetuning.latent_rl import build_latent
 from resfit.rl_finetuning.off_policy.common_utils import utils
 from resfit.rl_finetuning.off_policy.rl.q_agent import QAgent
 from resfit.rl_finetuning.utils.dtype import to_uint8
@@ -132,7 +133,9 @@ _CACHE_ROOT = Path(os.environ.get("CACHE_DIR", ".")).expanduser().resolve()
 
 # Dedicated sub-folders for the different cache types -----------------------
 OFFLINE_CACHE_DIR = _CACHE_ROOT / "offline_buffer_cache"
-ONLINE_CACHE_DIR = _CACHE_ROOT / "online_buffer_cache"
+# Replay memmaps on scratch NFS die with SIGBUS when the mount blips. Keep them on local disk.
+_REPLAY_ROOT = Path(os.environ.get("REPLAY_SCRATCH_DIR", "/tmp/resfit-replay")).expanduser()
+ONLINE_CACHE_DIR = _REPLAY_ROOT / "online_buffer_cache"
 
 
 # -----------------------------------------------------------------------------
@@ -156,6 +159,7 @@ def _make_replay_buffer(
     beta: float,
 ) -> ReplayBuffer:
     """Build a replay buffer. Falls back to uniform if TorchRL PER C++ ext is missing."""
+    _REPLAY_ROOT.mkdir(parents=True, exist_ok=True)
     kwargs = dict(
         storage=LazyTensorStorage(max_size=max_size, device="cpu"),
         transform=MultiStepTransform(n_steps=n_step, gamma=gamma),
@@ -245,6 +249,24 @@ def _resolve_local_policy_dir(ckpt: str | Path) -> Path:
         f"No policy config.json under {ckpt} or {ckpt / 'policy'}. "
         "Pass a policy_step_<n> dir, latest/, or the policy/ folder itself."
     )
+
+
+def _load_or_fit_latent(
+    *,
+    cfg: ResidualTD3DexmgConfig,
+    executed_action_dim: int,
+):
+    """Build the latent model"""
+    latent_cfg = cfg.algo.latent
+    latent = build_latent(latent_cfg, action_dim=executed_action_dim)
+    if latent is None:
+        return None
+
+    ckpt = latent_cfg.ckpt
+    if ckpt:
+        latent.load_ckpt(ckpt)
+        print(f"Loaded latent {latent.name} from {ckpt} (K={latent.latent_dim}, D={executed_action_dim})")
+    return latent
 
 
 # -----------------------------------------------------------------------------
@@ -446,7 +468,18 @@ def main(cfg: ResidualTD3DexmgConfig):
     assert isinstance(image_keys, list)
     lowdim_dim = env.observation_space["observation.state"].shape[1]
     img_c, img_h, img_w = env.observation_space[image_keys[0]].shape[1:]
-    action_dim = env.action_space.shape[1]
+    # Critic and replay see the executed chunk. The actor may instead output K latent coords.
+    executed_action_dim = int(env.action_space.shape[-1])
+    latent = _load_or_fit_latent(cfg=cfg, executed_action_dim=executed_action_dim)
+    if latent is not None and getattr(latent, "_fitted", False):
+        env.set_latent(latent)
+        eval_env.set_latent(latent)
+    actor_action_dim = int(latent.latent_dim) if latent is not None else executed_action_dim
+    action_dim = executed_action_dim
+    print(
+        f"Action dims: actor={actor_action_dim}, executed={executed_action_dim}, "
+        f"latent={cfg.algo.latent.name}"
+    )
 
     lowdim_keys = ["observation.state", "observation.base_action"]
 
@@ -460,6 +493,9 @@ def main(cfg: ResidualTD3DexmgConfig):
         rl_cameras=image_keys,
         cfg=cfg.agent,
         residual_actor=True,  # Enable residual actor mode
+        actor_action_dim=actor_action_dim,
+        base_action_dim=executed_action_dim,
+        latent=latent,
     )
     horizon = env.vec_env.metadata["horizon"]
 
@@ -511,6 +547,7 @@ def main(cfg: ResidualTD3DexmgConfig):
         "gamma": cfg.algo.gamma,
         "horizon": horizon,
         "warmup_episode": int(cfg.algo.warmup_episode),
+        "seed": cfg.seed,
         "sampling_strategy": cfg.algo.sampling_strategy,
         "buffer_size": cfg.algo.buffer_size,
         "batch_size": online_batch_size,
@@ -531,6 +568,10 @@ def main(cfg: ResidualTD3DexmgConfig):
         online_cache_meta["action_chunk"] = action_chunk
         online_cache_meta["requery"] = requery
         online_cache_meta["replay_gamma"] = rb_gamma
+    if str(cfg.algo.latent.name) not in ("none", ""):
+        online_cache_meta["latent_name"] = str(cfg.algo.latent.name)
+        online_cache_meta["latent_k"] = int(actor_action_dim)
+        online_cache_meta["latent_ckpt"] = cfg.algo.latent.ckpt or ""
 
     pprint.pprint(online_cache_meta)
     _online_meta_str = json.dumps(online_cache_meta, sort_keys=True)
@@ -547,7 +588,11 @@ def main(cfg: ResidualTD3DexmgConfig):
         online_cache_dir = dl_dir
 
     loaded_online_from_cache = False
-    if online_cache_dir.exists():
+    cache_ready = (online_cache_dir / "user_metadata.json").is_file()
+    if online_cache_dir.exists() and not cache_ready:
+        print(f"Removing incomplete online buffer cache at {online_cache_dir}")
+        shutil.rmtree(online_cache_dir)
+    if cache_ready:
         print(f"{online_cache_dir} found on disk. Attempting to load...")
         online_rb.sampler._empty()
         optimized_replay_buffer_loads(online_rb, online_cache_dir)
@@ -813,20 +858,32 @@ def main(cfg: ResidualTD3DexmgConfig):
     warmup_episodes = int(cfg.algo.warmup_episode)
     assert warmup_episodes > 0, f"warmup_episode must be positive, got {warmup_episodes}"
 
+    # If we are using latent model, the warmup episodes are collected without residual noise exploration. 
+    fit_chunks: list[np.ndarray] = []
     if not loaded_online_from_cache:
-        print(f"Warm-up: collecting {warmup_episodes} random episodes")
+        zero_residual = latent is not None
+        print(
+            f"Warm-up: collecting {warmup_episodes} "
+            f"{'base-policy' if zero_residual else 'random'} episodes"
+        )
         obs, _ = env.reset()
 
         reward_sum = 0.0
         episode_count = 0
 
         while episode_count < warmup_episodes:
-            if cfg.algo.use_base_policy_for_warmup:
+            if zero_residual:
+                base = obs["observation.base_action"]
+                if not getattr(latent, "_fitted", False):
+                    fit_chunks.append(base.detach().float().cpu().numpy().reshape(base.shape[0], -1)[0])
+                width = actor_action_dim if getattr(latent, "_fitted", False) else base.shape[-1]
+                rand_actions = torch.zeros((cfg.num_envs, width), device=device)
+            elif cfg.algo.use_base_policy_for_warmup:
                 # Use base policy action + noise (residual exploration)
                 # Since the environment wrapper always adds base_action to residual_action,
                 # we just need to provide the noise as the residual action
                 rand_actions = (
-                    torch.rand((cfg.num_envs, action_dim), device=device) * 2 - 1
+                    torch.rand((cfg.num_envs, actor_action_dim), device=device) * 2 - 1
                 ) * cfg.algo.random_action_noise_scale
             else:
                 # Pure uniform random actions - need to cancel out the base policy action
@@ -879,6 +936,24 @@ def main(cfg: ResidualTD3DexmgConfig):
         print(f"Warm-up done. Online buffer size = {len(online_rb)} transitions")
 
         loaded_online_from_cache = True  # treat as cached going forward
+
+    if latent is not None and not getattr(latent, "_fitted", False):
+        if fit_chunks:
+            chunks = np.stack(fit_chunks, axis=0)
+        else:
+            n = len(online_rb)
+            stored = online_rb.storage._storage["action"][:n]
+            chunks = stored.detach().cpu().numpy().reshape(n, -1)
+        chunks = np.asarray(chunks, dtype=np.float64)
+        print(f"Fitting latent {latent.name} on {len(chunks)} warmup windows (k={cfg.algo.latent.k})")
+        latent.fit(chunks)
+        if int(latent.latent_dim) != int(actor_action_dim):
+            raise RuntimeError(
+                f"Latent rank {latent.latent_dim} does not match actor width {actor_action_dim}"
+            )
+        env.set_latent(latent)
+        eval_env.set_latent(latent)
+        print(f"Fitted latent {latent.name}: K={latent.latent_dim}, D={executed_action_dim}")
 
     _hp_parts: list[str] = [
         cfg.task,  # e.g. "TwoArmBoxCleanup"
@@ -1011,7 +1086,8 @@ def main(cfg: ResidualTD3DexmgConfig):
     # ------------------------------------------------------------------
     # Critic warmup phase ----------------------------------------------
     # ------------------------------------------------------------------
-    if cfg.algo.critic_warmup_steps > 0:
+    critic_warmup_pending = False
+    if cfg.algo.critic_warmup_steps > 0 and len(online_rb) >= online_batch_size:
         print(f"Critic warmup: running {cfg.algo.critic_warmup_steps} critic-only updates...")
         _run_critic_warmup(
             agent=agent,
@@ -1024,6 +1100,9 @@ def main(cfg: ResidualTD3DexmgConfig):
             offline_batch_size=offline_batch_size,
         )
         print("Critic warmup completed.")
+    elif cfg.algo.critic_warmup_steps > 0:
+        critic_warmup_pending = True
+        print("Critic warmup deferred until the online buffer can fill a batch.")
 
     interval = cfg.eval_interval_every_steps
 
@@ -1055,6 +1134,7 @@ def main(cfg: ResidualTD3DexmgConfig):
     if cfg.eval_first:
         _evaluate()
 
+    metrics: dict = {}
     while global_step <= cfg.algo.total_timesteps:
         iter_start = time.time()
         # ------------------------------------------------------------------
@@ -1114,7 +1194,22 @@ def main(cfg: ResidualTD3DexmgConfig):
         # ------------------------------------------------------------------
         # (4) Updates -------------------------------------------------------
         # ------------------------------------------------------------------
-        if global_step % cfg.algo.update_every_n_steps == 0 or global_step == cfg.num_envs:
+        buffer_ready = len(online_rb) >= online_batch_size
+        if critic_warmup_pending and buffer_ready:
+            print(f"Critic warmup: running {cfg.algo.critic_warmup_steps} critic-only updates...")
+            _run_critic_warmup(
+                agent=agent,
+                online_rb=online_rb,
+                offline_rb=offline_rb,
+                cfg=cfg,
+                device=device,
+                training_timer=training_timer,
+                online_batch_size=online_batch_size,
+                offline_batch_size=offline_batch_size,
+            )
+            print("Critic warmup completed.")
+            critic_warmup_pending = False
+        if buffer_ready and (global_step % cfg.algo.update_every_n_steps == 0 or global_step == cfg.num_envs):
             i = 0
             actor_update_cadence = cfg.algo.num_updates_per_iteration // cfg.algo.actor_updates_per_iteration
             # Normal training loop - critic is already warmed up
@@ -1242,11 +1337,16 @@ def main(cfg: ResidualTD3DexmgConfig):
                     f"critic_loss={metrics['train/critic_loss']:.4f} "
                     f"actor_lr={current_actor_lr:.2e}"
                 )
-            else:
+            elif "train/critic_loss" in metrics:
                 # During critic warmup, actor might not be updated
                 print_msg = (
                     f"[{global_step}] critic_loss={metrics['train/critic_loss']:.4f} "
                     f"actor_lr={current_actor_lr:.2e} (actor not updated)"
+                )
+            else:
+                print_msg = (
+                    f"[{global_step}] collecting online buffer "
+                    f"{len(online_rb)}/{online_batch_size} actor_lr={current_actor_lr:.2e}"
                 )
             if residual_l1_magnitude is not None and residual_l2_magnitude is not None:
                 print_msg += f" residual_l1={residual_l1_magnitude:.4f} residual_l2={residual_l2_magnitude:.4f}"

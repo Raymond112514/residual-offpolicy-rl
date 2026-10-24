@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from hydra.core.config_store import ConfigStore
 
 from resfit.rl_finetuning.config.rlpd import ActorConfig, QAgentConfig, RLPDAlgoConfig, RLPDDexmgConfig
+from resfit.rl_finetuning.latent_rl.config import LatentConfig
 
 
 @dataclass
@@ -80,6 +81,10 @@ class ResidualTD3AlgoConfig(RLPDAlgoConfig):
     # Defines the reward used for action chunk. If True, the reward is the discounted sum of the per step rewards. If False, the reward is 1 if any step in the chunk succeeds, else 0.
     action_chunk_reward_discount: bool = True
     warmup_episode: int = 30
+
+    # none: residual actor outputs the chunk residual.
+    # pca: residual actor outputs K coefficients of a basis fit on base-policy chunks.
+    latent: LatentConfig = field(default_factory=LatentConfig)
 
 # -----------------------------------------------------------------------------
 # Top-level experiment config --------------------------------------------------
